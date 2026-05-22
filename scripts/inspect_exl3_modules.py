@@ -55,7 +55,12 @@ def main() -> int:
         )
     finally:
         _sys.argv = _orig_argv
-    model = Exl3Model(settings)
+
+    # inspect_only=True skips weight loading + cache allocation; the
+    # module tree (and .key strings we filter on) is built at
+    # Model.from_config() time, so structure inspection is fast and
+    # doesn't need any VRAM.
+    model = Exl3Model(settings, inspect_only=True)
 
     # Group target Linears by layer (and component, the way Heretic uses them).
     per_layer: list[dict[str, list[str]]] = []
