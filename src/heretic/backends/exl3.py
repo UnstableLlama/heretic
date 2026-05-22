@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from contextlib import suppress
 from types import ModuleType
 from typing import Any
 
@@ -38,28 +39,42 @@ class Exl3Backend(ModelBackend):
         return self._load_exllamav3_module()
 
     def _resolve_exl3_types(self, exllamav3: ModuleType) -> tuple[type[Any], type[Any], type[Any]]:
-        config_type = getattr(exllamav3, "ExLlamaV3Config", None)
-        model_type = getattr(exllamav3, "ExLlamaV3", None)
-        generator_type = getattr(exllamav3, "ExLlamaV3DynamicGenerator", None)
+        """Resolve classes using documented exllamav3 public API first.
 
-        if config_type is not None and model_type is not None and generator_type is not None:
-            return config_type, model_type, generator_type
+        ExLlamaV3 examples import `Config`, `Model`, and `Generator` from the
+        top-level package, while older builds may expose `ExLlamaV3*` names.
+        """
 
-        module_model = importlib.import_module("exllamav3.model")
-        module_generator = importlib.import_module("exllamav3.generator")
+        modules: list[ModuleType] = [exllamav3]
+        for module_name in ("exllamav3.model", "exllamav3.generator"):
+            with suppress(ModuleNotFoundError):
+                modules.append(importlib.import_module(module_name))
 
-        config_type = config_type or getattr(module_model, "ExLlamaV3Config", None)
-        model_type = model_type or getattr(module_model, "ExLlamaV3", None)
-        generator_type = generator_type or getattr(
-            module_generator,
-            "ExLlamaV3DynamicGenerator",
-            None,
-        )
+        def resolve(candidates: tuple[str, ...]) -> type[Any] | None:
+            for module in modules:
+                for candidate in candidates:
+                    resolved = getattr(module, candidate, None)
+                    if isinstance(resolved, type):
+                        return resolved
+            return None
+
+        config_type = resolve(("Config", "ExLlamaV3Config"))
+        model_type = resolve(("Model", "ExLlamaV3"))
+        generator_type = resolve(("Generator", "ExLlamaV3DynamicGenerator"))
 
         if config_type is None or model_type is None or generator_type is None:
+            discovered = sorted(
+                {
+                    name
+                    for module in modules
+                    for name in dir(module)
+                    if name in {"Config", "Model", "Generator", "ExLlamaV3Config", "ExLlamaV3", "ExLlamaV3DynamicGenerator"}
+                }
+            )
             raise RuntimeError(
-                "Unsupported exllamav3 API surface: missing one or more required "
-                "types (ExLlamaV3Config, ExLlamaV3, ExLlamaV3DynamicGenerator)."
+                "Unsupported exllamav3 API surface: expected documented classes "
+                "Config/Model/Generator (or legacy ExLlamaV3* aliases). "
+                f"Discovered relevant symbols: {discovered}"
             )
 
         return config_type, model_type, generator_type
