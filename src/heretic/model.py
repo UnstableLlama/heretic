@@ -29,6 +29,7 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
+from .backends import HfBnbBackend
 from .config import QuantizationMethod, RowNormalization, Settings
 from .system import empty_cache
 from .utils import Prompt, batchify, print
@@ -149,6 +150,7 @@ class Model:
             raise Exception("Failed to load model with all configured dtypes.")
 
         self._apply_lora()
+        self.backend = HfBnbBackend(self)
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -332,6 +334,7 @@ class Model:
         )
 
         self._apply_lora()
+        self.backend = HfBnbBackend(self)
 
         self.needs_reload = False
 
