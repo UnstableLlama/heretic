@@ -155,23 +155,26 @@ class Exl3Model:
         self.trusted_models: dict[str, bool | None] = {settings.model: False}
 
         # Import lazily so the optional dep doesn't crash users on the HF path.
-        self._exl = self._import_exllamav3()
+        # We resolve each class from its submodule directly so the integration
+        # doesn't depend on which symbols __init__.py happens to re-export
+        # (this varies between PyPI releases and the master branch).
+        self._exl_api = self._resolve_exllamav3_api()
 
         print()
         print(f"Loading EXL3 model [bold]{settings.model}[/]...")
 
         model_path = str(Path(settings.model).expanduser())
         # 1. Config -> Model -> Cache -> Tokenizer
-        self.config = self._exl.Config.from_directory(model_path)
-        self.model = self._exl.Model.from_config(self.config)
-        self.cache = self._exl.Cache(
+        self.config = self._exl_api["Config"].from_directory(model_path)
+        self.model = self._exl_api["Model"].from_config(self.config)
+        self.cache = self._exl_api["Cache"](
             self.model,
             max_num_tokens=int(settings.exl3_max_num_tokens),
         )
         self.model.load(progressbar=True)
 
         # Tokenizer
-        exl3_tok = self._exl.Tokenizer.from_config(self.config)
+        exl3_tok = self._exl_api["Tokenizer"].from_config(self.config)
         self.tokenizer = _Exl3Tokenizer(exl3_tok, model_path)
 
         # 2. Discover target modules, group by layer, allocate LoRA slots
@@ -210,6 +213,55 @@ class Exl3Model:
                 "ExLlamaV3 backend selected but 'exllamav3' is not installed. "
                 "Install with: pip install -U 'heretic-llm[exl3]'"
             ) from error
+
+    @classmethod
+    def _resolve_exllamav3_api(cls) -> dict[str, type]:
+        """Resolve Config / Model / Cache / Tokenizer / Generator across
+        exllamav3 versions. The top-level ``__init__.py`` re-exports vary
+        between PyPI releases and master; the submodule paths are the
+        stable surface.
+        """
+        cls._import_exllamav3()  # raise a friendly error if missing
+
+        candidates = {
+            "Config":    [("exllamav3.model.config", "Config"),
+                          ("exllamav3.config",       "Config"),
+                          ("exllamav3",              "Config")],
+            "Model":     [("exllamav3.model.model",  "Model"),
+                          ("exllamav3.model",        "Model"),
+                          ("exllamav3",              "Model")],
+            "Cache":     [("exllamav3.cache.cache",  "Cache"),
+                          ("exllamav3.cache",        "Cache"),
+                          ("exllamav3",              "Cache")],
+            "Tokenizer": [("exllamav3.tokenizer.tokenizer", "Tokenizer"),
+                          ("exllamav3.tokenizer",   "Tokenizer"),
+                          ("exllamav3",             "Tokenizer")],
+            "Generator": [("exllamav3.generator.generator", "Generator"),
+                          ("exllamav3.generator",   "Generator"),
+                          ("exllamav3",             "Generator")],
+        }
+
+        resolved: dict[str, type] = {}
+        misses: dict[str, list[str]] = {}
+        for name, attempts in candidates.items():
+            for module_name, attr in attempts:
+                with suppress(ImportError, AttributeError):
+                    mod = importlib.import_module(module_name)
+                    obj = getattr(mod, attr)
+                    if isinstance(obj, type):
+                        resolved[name] = obj
+                        break
+            if name not in resolved:
+                misses[name] = [f"{m}.{a}" for m, a in attempts]
+
+        if misses:
+            raise RuntimeError(
+                "Could not resolve required exllamav3 API symbols: "
+                + ", ".join(f"{k} (tried {' | '.join(v)})" for k, v in misses.items())
+                + ". Your exllamav3 install may have rearranged its public surface; "
+                "report the package version and __init__.py contents."
+            )
+        return resolved
 
     def _discover_modules(self) -> None:
         """Walk the loaded model, find o_proj / down_proj Linears, group
@@ -592,11 +644,12 @@ class Exl3Model:
 
     def _ensure_generator(self) -> Any:
         if self._generator is None:
-            Generator = self._exl.Generator
+            Generator = self._exl_api["Generator"]
+            Tokenizer = self._exl_api["Tokenizer"]
             self._generator = Generator(
                 model=self.model,
                 cache=self.cache,
-                tokenizer=self._exl.Tokenizer.from_config(self.config),
+                tokenizer=Tokenizer.from_config(self.config),
             )
         return self._generator
 
