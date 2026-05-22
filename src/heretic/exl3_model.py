@@ -28,10 +28,13 @@ Design notes (see HANDOFF_EXL3.md):
   updates on the unpadded slice, then zero-pad to the padded shape
   before copying in.
 
-* Per-layer hidden states (residuals): we flip
-  ``block.export_state = True`` on every ``TransformerBlock``, then
-  inject a pre-block-0 capture so the first entry mirrors HF's
-  ``hidden_states[0]`` (embedding output).
+* Per-layer hidden states (residuals): we wrap every decoder block's
+  ``forward`` to append its output to ``params["export_states"]``. The
+  first block also captures its input so the list starts with
+  post-embedding state, matching HF's ``hidden_states[0]``. We don't
+  rely on exllamav3's ``export_state`` attribute because not all block
+  classes honor it (Qwen 3.5 hybrid blocks, for example, don't append
+  on ``export_state=True``).
 """
 
 from __future__ import annotations
@@ -385,15 +388,19 @@ class Exl3Model:
         module.lora_b_tensors[self._lora_key] = b
 
     def _install_residual_hooks(self) -> None:
-        """Find decoder block modules by key pattern, enable
-        ``export_state`` where supported, and wrap the first block's
-        ``forward`` to also capture x at entry — so the captured list is
+        """Find decoder block modules by key pattern and wrap each one's
+        ``forward`` to append its output into ``params["export_states"]``.
+        The first block also captures its input so the captured list is
         ``[embed_out, block0_out, block1_out, ...]``, matching HF's
         ``hidden_states`` shape.
 
         We identify blocks by ``.key`` matching ``model[.language_model].layers.N``
         rather than ``isinstance(TransformerBlock)`` so this works on
-        custom block classes (hybrid, parallel decoder, etc.).
+        custom block classes (hybrid, parallel decoder, etc.). We don't
+        use exllamav3's ``export_state`` attribute because not all block
+        classes honor it — Qwen 3.5 hybrid blocks, for one, don't append
+        when it's set. Wrapping ``forward`` is uniform across block
+        classes.
         """
         # Find blocks by key pattern. Tuple of (layer_idx, module) so we
         # can sort by layer index reliably.
@@ -417,25 +424,30 @@ class Exl3Model:
         block_pairs.sort(key=lambda t: t[0])
         blocks = [m for _, m in block_pairs]
 
-        # Enable export_state where the attribute exists. If a particular
-        # block class doesn't have it, we lose residual capture from that
-        # block — but we don't fail the whole load.
+        # Where the upstream attribute exists, ensure it stays off so it
+        # doesn't double-capture alongside our wrapper.
         for block in blocks:
             if hasattr(block, "export_state"):
-                block.export_state = True
+                block.export_state = False
 
-        first_block = blocks[0]
-        original_forward = first_block.forward
+        def _make_wrapper(orig: Any, capture_input: bool) -> Any:
+            def wrapped(x, params, out_dtype=None):
+                states = params.get("export_states")
+                if states is None:
+                    states = params["export_states"] = []
+                if capture_input:
+                    states.append(x.half().clone())
+                out = orig(x, params, out_dtype=out_dtype)
+                # Some block classes may return (hidden, extras); only
+                # capture the hidden tensor.
+                captured = out[0] if isinstance(out, tuple) else out
+                states.append(captured.half().clone())
+                return out
+            return wrapped
 
-        def capturing_forward(x, params, out_dtype=None, _orig=original_forward):
-            states = params.get("export_states")
-            if states is None:
-                states = params["export_states"] = []
-            # Capture pre-block-0 state == post-embedding state.
-            states.append(x.half().clone())
-            return _orig(x, params, out_dtype=out_dtype)
+        for idx, block in enumerate(blocks):
+            block.forward = _make_wrapper(block.forward, capture_input=(idx == 0))
 
-        first_block.forward = capturing_forward
         self._blocks = blocks
         self._num_layers = len(blocks)
 

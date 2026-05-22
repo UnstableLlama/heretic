@@ -1,9 +1,11 @@
 # Heretic EXL3 Integration Handoff
 
 **Status as of latest session:** smoke test passes strictly on Qwen 3.5-2B
-hybrid; first full optimization run is in flight and appears to be working.
-Backend abstraction was rewritten from scratch against verified upstream
-sources — no more guess-and-check.
+hybrid. First full optimization run got past load / batch-sizing / initial
+refusal counting and then hit a residual-capture failure on hybrid blocks,
+which has now been fixed by wrapping each block's `forward` directly
+(no longer relying on `export_state`). Awaits a fresh full-loop run to
+confirm the rest of the pipeline.
 
 ---
 
@@ -211,15 +213,23 @@ the HF path. For EXL3 we skip straight to adapter sidecar with a
 print message but don't surface that to the user as an explicit
 "EXL3 — saving adapter sidecar" upfront. Minor.
 
-### Residual capture on non-`TransformerBlock` block classes
+### Residual capture on non-`TransformerBlock` block classes — RESOLVED
 
-Current block discovery finds blocks by `.key` pattern but only sets
-`export_state = True` where the attribute exists. If a block class
-doesn't have it, that layer's residuals are silently absent. This
-will surface as a shape mismatch in `get_residuals` ("expected N+1
-captures, got M"). The full-loop run in progress will tell us
-whether this is an issue on Qwen 3.5 hybrid; on stock `TransformerBlock`
-classes it's fine.
+The full optimization run on Qwen 3.5-2B hit exactly this:
+
+```
+RuntimeError: Expected 25 captured residuals, got 1.
+```
+
+The hybrid block class (Qwen 3.5 GatedDeltaNet) doesn't honor
+`export_state=True` — setting it had no effect, so only the
+pre-block-0 wrapper produced a capture (hence `got 1`). Fixed by
+wrapping every decoder block's `forward` directly instead of relying
+on the upstream attribute. The wrapper appends the block's output to
+`params["export_states"]`; block 0's wrapper additionally captures
+the input (== post-embedding state). For belt-and-braces, where
+`export_state` exists we explicitly set it to `False` to avoid the
+chance of double-capture on architectures whose default is True.
 
 ### Cache hygiene across batches
 
