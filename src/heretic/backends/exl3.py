@@ -123,8 +123,20 @@ class Exl3Backend(ModelBackend):
 
     def load_tokenizer(self, tokenizer_path: str | None = None, **kwargs: Any) -> Any:
         self._require_exllamav3()
+        if self.model is None:
+            raise RuntimeError("Model is not loaded; call load_model first.")
+
+        if self.tokenizer is None and self.generator is not None and hasattr(self.generator, "tokenizer"):
+            self.tokenizer = getattr(self.generator, "tokenizer")
+
+        if self.tokenizer is None and hasattr(self.model, "tokenizer"):
+            self.tokenizer = getattr(self.model, "tokenizer")
+
         if self.tokenizer is None:
-            raise RuntimeError("load_model must be called before load_tokenizer.")
+            raise RuntimeError(
+                "No exllamav3 Tokenizer type was discovered and no tokenizer instance "
+                "was exposed by model/generator in this runtime."
+            )
         return self.tokenizer
 
     def generate_raw_text(self, prompt: str, **kwargs: Any) -> str:
