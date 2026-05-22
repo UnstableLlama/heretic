@@ -52,6 +52,16 @@ research = [
     "pacmap~=0.8",
     "scikit-learn~=1.7",
 ]
+exl3 = [
+    # ExLlamaV3 ships compiled CUDA kernels and exposes internals that
+    # change across point releases (Module iteration, TransformerBlock
+    # .export_state, LinearEXL3.get_weight_tensor, Linear.lora_a/b_tensors).
+    # Pin a known-good version and re-audit before bumping. The master
+    # branch is 0.0.34 but the latest PyPI release is 0.0.33; the API
+    # surface this code targets is stable across both.
+    "exllamav3==0.0.33",
+    "safetensors>=0.4",
+]
 
 [dependency-groups]
 dev = [
