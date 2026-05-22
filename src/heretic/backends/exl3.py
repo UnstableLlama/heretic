@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+from types import ModuleType
 from typing import Any
 
 from torch import LongTensor, Tensor
@@ -25,29 +27,51 @@ class Exl3Backend(ModelBackend):
         self.model: Any | None = None
         self.tokenizer: Any | None = None
         self.generator: Any | None = None
-        self._has_exllamav3 = False
+        self._exllamav3: ModuleType | None = None
 
-    def _require_exllamav3(self) -> None:
-        if not self._has_exllamav3:
+    def _load_exllamav3_module(self) -> ModuleType:
+        if self._exllamav3 is None:
+            self._exllamav3 = importlib.import_module("exllamav3")
+        return self._exllamav3
+
+    def _require_exllamav3(self) -> ModuleType:
+        return self._load_exllamav3_module()
+
+    def _resolve_exl3_types(self, exllamav3: ModuleType) -> tuple[type[Any], type[Any], type[Any]]:
+        config_type = getattr(exllamav3, "ExLlamaV3Config", None)
+        model_type = getattr(exllamav3, "ExLlamaV3", None)
+        generator_type = getattr(exllamav3, "ExLlamaV3DynamicGenerator", None)
+
+        if config_type is not None and model_type is not None and generator_type is not None:
+            return config_type, model_type, generator_type
+
+        module_model = importlib.import_module("exllamav3.model")
+        module_generator = importlib.import_module("exllamav3.generator")
+
+        config_type = config_type or getattr(module_model, "ExLlamaV3Config", None)
+        model_type = model_type or getattr(module_model, "ExLlamaV3", None)
+        generator_type = generator_type or getattr(
+            module_generator,
+            "ExLlamaV3DynamicGenerator",
+            None,
+        )
+
+        if config_type is None or model_type is None or generator_type is None:
             raise RuntimeError(
-                "ExLlamaV3 dependency is unavailable. Install ExLlamaV3 in the "
-                "runtime environment before using Exl3Backend."
+                "Unsupported exllamav3 API surface: missing one or more required "
+                "types (ExLlamaV3Config, ExLlamaV3, ExLlamaV3DynamicGenerator)."
             )
 
+        return config_type, model_type, generator_type
+
     def load_model(self, model_path: str, **kwargs: Any) -> Any:
-        try:
-            import exllamav3  # ty:ignore[import-not-found]
-        except Exception as error:
-            raise RuntimeError(
-                "Failed to import ExLlamaV3 Python package while loading model."
-            ) from error
+        exllamav3 = self._require_exllamav3()
+        config_type, model_type, generator_type = self._resolve_exl3_types(exllamav3)
 
-        self._has_exllamav3 = True
-
-        config = exllamav3.ExLlamaV3Config(model_path)
-        self.model = exllamav3.ExLlamaV3(config)
+        config = config_type(model_path)
+        self.model = model_type(config)
         self.model.load()
-        self.generator = exllamav3.ExLlamaV3DynamicGenerator(self.model)
+        self.generator = generator_type(self.model)
         return self.model
 
     def load_tokenizer(self, tokenizer_path: str | None = None, **kwargs: Any) -> Any:
