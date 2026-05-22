@@ -57,16 +57,25 @@ from .utils import Prompt, batchify, print
 
 
 # Match keys like:
-#   model.layers.<N>.self_attn.o_proj
-#   model.layers.<N>.mlp.down_proj
-#   model.layers.<N>.mlp.down_proj.slice.<M>
-#   model.layers.<N>.block_sparse_moe.experts.<I>.down_proj
-#   model.layers.<N>.<any>.down_proj
-# We accept any sub-path between the layer index and the leaf suffix so
-# we cover MoE expert paths, hybrid linear-attention paths, and other
-# architecture variants that put o_proj / down_proj at deeper nesting.
+#   model.layers.<N>.self_attn.o_proj                     (standard)
+#   model.layers.<N>.mlp.down_proj                        (standard)
+#   model.layers.<N>.mlp.down_proj.slice.<M>              (sliced MLP)
+#   model.layers.<N>.block_sparse_moe.experts.<I>.down_proj  (MoE)
+#   model.language_model.layers.<N>.linear_attn.out_proj  (Qwen3.5 hybrid: linear attn + multimodal wrap)
+#   model.language_model.layers.<N>.mlp.down_proj         (multimodal wrap)
+# Accept any sub-path between the layer block and the leaf suffix. The
+# optional ``language_model`` segment covers multimodal models that nest
+# the LM under a vision/audio wrapper. The leaf suffix matches both
+# ``o_proj`` (standard) and ``out_proj`` (hybrid linear-attention).
 _MODULE_KEY_REGEX = re.compile(
-    r"^model\.layers\.(\d+)\.(.*?)(o_proj|down_proj)(?:\.slice\.\d+)?$"
+    r"^model(?:\.language_model)?\.layers\.(\d+)\..*?\.(o_proj|out_proj|down_proj)(?:\.slice\.\d+)?$"
+)
+
+# Block-level keys, used to find decoder layers without depending on
+# isinstance(TransformerBlock) (some architectures use custom block
+# classes).
+_BLOCK_KEY_REGEX = re.compile(
+    r"^model(?:\.language_model)?\.layers\.(\d+)$"
 )
 
 
@@ -148,11 +157,20 @@ class Exl3Model:
     needs_reload: bool
     tokenizer: _Exl3Tokenizer
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, inspect_only: bool = False):
+        """Load an EXL3 model.
+
+        ``inspect_only=True`` skips weight loading, cache allocation and
+        tokenizer instantiation. Use it for module-structure inspection
+        when you don't need to run a forward pass — the module tree
+        (and ``.key`` strings) is built at ``Model.from_config()`` time,
+        so we can discover targets without paying the load cost.
+        """
         self.settings = settings
         self.needs_reload = False
         self.revision_kwargs: dict[str, Any] = {}
         self.trusted_models: dict[str, bool | None] = {settings.model: False}
+        self._inspect_only = inspect_only
 
         # Import lazily so the optional dep doesn't crash users on the HF path.
         # We resolve each class from its submodule directly so the integration
@@ -161,35 +179,59 @@ class Exl3Model:
         self._exl_api = self._resolve_exllamav3_api()
 
         print()
-        print(f"Loading EXL3 model [bold]{settings.model}[/]...")
+        print(
+            f"Loading EXL3 model [bold]{settings.model}[/]"
+            + (" (inspect-only)" if inspect_only else "")
+            + "..."
+        )
 
         model_path = str(Path(settings.model).expanduser())
-        # 1. Config -> Model -> Cache -> Tokenizer
         self.config = self._exl_api["Config"].from_directory(model_path)
         self.model = self._exl_api["Model"].from_config(self.config)
-        self.cache = self._exl_api["Cache"](
-            self.model,
-            max_num_tokens=int(settings.exl3_max_num_tokens),
-        )
-        self.model.load(progressbar=True)
 
-        # Tokenizer
-        exl3_tok = self._exl_api["Tokenizer"].from_config(self.config)
-        self.tokenizer = _Exl3Tokenizer(exl3_tok, model_path)
+        if inspect_only:
+            # Module tree is already built; no cache, no weight load, no
+            # tokenizer. discover_modules walks .key strings — doesn't
+            # need weights. Residual hooks aren't installed because no
+            # forward pass will run.
+            self.cache = None
+            self.tokenizer = None  # type: ignore[assignment]
+        else:
+            # Cache sizing: the user setting is the working bound on
+            #   batch_size * seq_len  during any forward pass.
+            # For Heretic this is dominated by residual/logprob batches
+            # (typically 32 prompts * ~256 tokens = 8k tokens), not the
+            # model's declared max_seq_len. We just honour the setting
+            # rounded up to the 256-token page size; users who need
+            # larger batches or longer sequences can raise it via
+            # exl3_max_num_tokens.
+            target = max(int(settings.exl3_max_num_tokens), 2048)
+            max_num_tokens = ((target + 255) // 256) * 256
+            self.cache = self._exl_api["Cache"](
+                self.model, max_num_tokens=max_num_tokens
+            )
+            self.model.load(progressbar=True)
 
-        # 2. Discover target modules, group by layer, allocate LoRA slots
+            exl3_tok = self._exl_api["Tokenizer"].from_config(self.config)
+            self.tokenizer = _Exl3Tokenizer(exl3_tok, model_path)
+
+        # 2. Discover target modules, group by layer, allocate LoRA slots.
+        #    Module-tree discovery only reads .key strings, so it works even
+        #    without weights loaded. LoRA slot allocation needs module.device,
+        #    which is only valid after load — so we skip it in inspect_only mode.
         self._lora_key = object()  # any hashable; used as the dict key
         self._layer_modules: list[dict[str, list[Any]]] = []
-        self._discover_modules()
+        self._discover_modules(allocate_lora_slots=not inspect_only)
 
-        # 3. Enable residual capture on every TransformerBlock + inject
-        #    a pre-block-0 capture so we get an "embedding output" entry
-        #    that mirrors HF's hidden_states[0].
-        self._install_residual_hooks()
-
-        # 4. Generator (lazy; only built on first generate call so we
-        #    don't pay the cost for runs that only need residuals).
-        self._generator = None
+        # 3. Residual hooks and generator only make sense when weights are loaded.
+        if not inspect_only:
+            self._install_residual_hooks()
+            self._generator = None
+        else:
+            self._blocks = []
+            self._num_layers = 0
+            self._generator = None
+            return
 
         print(f"* Transformer model with [bold]{len(self._layer_modules)}[/] layers")
         all_components: dict[str, int] = {}
@@ -263,9 +305,14 @@ class Exl3Model:
             )
         return resolved
 
-    def _discover_modules(self) -> None:
+    def _discover_modules(self, *, allocate_lora_slots: bool = True) -> None:
         """Walk the loaded model, find o_proj / down_proj Linears, group
-        by layer index, allocate a (lora_A, lora_B) pair on each one."""
+        by layer index, allocate a (lora_A, lora_B) pair on each one.
+
+        ``allocate_lora_slots=False`` skips the per-target slot allocation,
+        which is required for inspect-only loads where modules are not on
+        a device yet.
+        """
         # Import the concrete Linear class so we can identity-check.
         linear_mod = importlib.import_module("exllamav3.modules.linear")
         Linear = linear_mod.Linear
@@ -284,8 +331,14 @@ class Exl3Model:
             if not isinstance(module, Linear):
                 continue
             layer_idx = int(m.group(1))
-            leaf = m.group(3)  # "o_proj" or "down_proj"
-            component = "attn.o_proj" if leaf == "o_proj" else "mlp.down_proj"
+            leaf = m.group(2)  # "o_proj" | "out_proj" | "down_proj"
+            if leaf == "down_proj":
+                component = "mlp.down_proj"
+            else:
+                # Both "o_proj" (standard attention) and "out_proj" (hybrid
+                # linear attention, e.g. Qwen3.5 GatedDeltaNet) feed into
+                # the same residual stream and should be ablated together.
+                component = "attn.o_proj"
             by_layer.setdefault(layer_idx, {}).setdefault(component, []).append(module)
 
         self._all_module_keys = all_keys
@@ -310,10 +363,11 @@ class Exl3Model:
 
         # Pre-allocate LoRA tensors on every target Linear.
         # Shapes: A is (in_features, 1), B is (1, out_features). Both fp16.
-        for per_layer in self._layer_modules:
-            for modules in per_layer.values():
-                for module in modules:
-                    self._allocate_lora_slot(module)
+        if allocate_lora_slots:
+            for per_layer in self._layer_modules:
+                for modules in per_layer.values():
+                    for module in modules:
+                        self._allocate_lora_slot(module)
 
     def _allocate_lora_slot(self, module: Any) -> None:
         device = module.device
@@ -331,29 +385,45 @@ class Exl3Model:
         module.lora_b_tensors[self._lora_key] = b
 
     def _install_residual_hooks(self) -> None:
-        """Set ``export_state = True`` on each TransformerBlock and wrap
-        the first one's ``forward`` to also capture x at entry — so the
-        captured list is ``[embed_out, block0_out, block1_out, ...]``,
-        matching HF's ``hidden_states`` shape.
+        """Find decoder block modules by key pattern, enable
+        ``export_state`` where supported, and wrap the first block's
+        ``forward`` to also capture x at entry — so the captured list is
+        ``[embed_out, block0_out, block1_out, ...]``, matching HF's
+        ``hidden_states`` shape.
+
+        We identify blocks by ``.key`` matching ``model[.language_model].layers.N``
+        rather than ``isinstance(TransformerBlock)`` so this works on
+        custom block classes (hybrid, parallel decoder, etc.).
         """
-        transformer_mod = importlib.import_module("exllamav3.modules.transformer")
-        TransformerBlock = transformer_mod.TransformerBlock
-
-        blocks: list[Any] = []
+        # Find blocks by key pattern. Tuple of (layer_idx, module) so we
+        # can sort by layer index reliably.
+        block_pairs: list[tuple[int, Any]] = []
         for module in self.model:
-            if isinstance(module, TransformerBlock):
-                module.export_state = True
-                blocks.append(module)
+            key = getattr(module, "key", None)
+            if not isinstance(key, str):
+                continue
+            m = _BLOCK_KEY_REGEX.match(key)
+            if m is None:
+                continue
+            block_pairs.append((int(m.group(1)), module))
 
-        if not blocks:
+        if not block_pairs:
             raise RuntimeError(
-                "No TransformerBlock instances found in model. "
-                "Residual capture requires the standard transformer block class; "
-                "this runtime may use ParallelDecoderBlock or a custom block."
+                "No decoder block modules found. Residual capture needs at "
+                "least one module whose .key matches "
+                "^model(?:\\.language_model)?\\.layers\\.\\d+$."
             )
 
-        # Sort by layer_idx so blocks[0] really is layer 0.
-        blocks.sort(key=lambda b: (b.layer_idx if b.layer_idx is not None else -1))
+        block_pairs.sort(key=lambda t: t[0])
+        blocks = [m for _, m in block_pairs]
+
+        # Enable export_state where the attribute exists. If a particular
+        # block class doesn't have it, we lose residual capture from that
+        # block — but we don't fail the whole load.
+        for block in blocks:
+            if hasattr(block, "export_state"):
+                block.export_state = True
+
         first_block = blocks[0]
         original_forward = first_block.forward
 
