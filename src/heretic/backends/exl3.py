@@ -34,8 +34,10 @@ class Exl3Backend(ModelBackend):
     def _require_exllamav3(self) -> ModuleType:
         return self._load_exllamav3_module()
 
-    def _resolve_exl3_types(self, exllamav3: ModuleType) -> tuple[type[Any], type[Any], type[Any], type[Any], type[Any]]:
-        """Resolve documented exllamav3 public API types."""
+    def _resolve_exl3_types(
+        self, exllamav3: ModuleType
+    ) -> tuple[type[Any], type[Any], type[Any] | None, type[Any] | None, type[Any] | None]:
+        """Resolve exllamav3 API types with compatibility fallbacks."""
         modules: list[ModuleType] = [exllamav3]
         for module_name in ("exllamav3.model", "exllamav3.generator"):
             with suppress(ModuleNotFoundError):
@@ -55,7 +57,9 @@ class Exl3Backend(ModelBackend):
         tokenizer_type = resolve(("Tokenizer", "ExLlamaV3Tokenizer"))
         generator_type = resolve(("Generator", "ExLlamaV3DynamicGenerator"))
 
-        if any(t is None for t in (config_type, model_type, cache_type, tokenizer_type, generator_type)):
+        # Config + Model are required to load and inspect modules.
+        # Cache/Tokenizer/Generator are optional across some exllamav3 builds.
+        if any(t is None for t in (config_type, model_type)):
             discovered = sorted(
                 {
                     name
@@ -76,8 +80,8 @@ class Exl3Backend(ModelBackend):
                 }
             )
             raise RuntimeError(
-                "Unsupported exllamav3 API surface: expected Config/Model/Cache/Tokenizer/Generator "
-                "(or legacy ExLlamaV3* aliases). "
+                "Unsupported exllamav3 API surface: expected at least Config/Model "
+                "(with optional Cache/Tokenizer/Generator and legacy ExLlamaV3* aliases). "
                 f"Discovered relevant symbols: {discovered}"
             )
 
@@ -89,14 +93,32 @@ class Exl3Backend(ModelBackend):
 
         self.config = config_type.from_directory(model_path)
         self.model = model_type.from_config(self.config)
-        self.cache = cache_type(self.model, max_num_tokens=int(kwargs.get("max_num_tokens", 8192)))
         self.model.load(progressbar=bool(kwargs.get("progressbar", False)))
-        self.tokenizer = tokenizer_type.from_config(self.config)
-        self.generator = generator_type(
-            model=self.model,
-            cache=self.cache,
-            tokenizer=self.tokenizer,
-        )
+
+        self.cache = None
+        self.tokenizer = None
+        self.generator = None
+
+        if cache_type is not None:
+            self.cache = cache_type(self.model, max_num_tokens=int(kwargs.get("max_num_tokens", 8192)))
+
+        if tokenizer_type is not None:
+            self.tokenizer = tokenizer_type.from_config(self.config)
+
+        if generator_type is not None:
+            init_attempts: list[dict[str, Any]] = []
+            if self.cache is not None and self.tokenizer is not None:
+                init_attempts.append({"model": self.model, "cache": self.cache, "tokenizer": self.tokenizer})
+            if self.tokenizer is not None:
+                init_attempts.append({"model": self.model, "tokenizer": self.tokenizer})
+            if self.cache is not None:
+                init_attempts.append({"model": self.model, "cache": self.cache})
+            init_attempts.append({"model": self.model})
+
+            for init_kwargs in init_attempts:
+                with suppress(TypeError):
+                    self.generator = generator_type(**init_kwargs)
+                    break
         return self.model
 
     def load_tokenizer(self, tokenizer_path: str | None = None, **kwargs: Any) -> Any:
@@ -108,7 +130,10 @@ class Exl3Backend(ModelBackend):
     def generate_raw_text(self, prompt: str, **kwargs: Any) -> str:
         self._require_exllamav3()
         if self.generator is None:
-            raise RuntimeError("Model is not loaded; call load_model first.")
+            raise RuntimeError(
+                "No compatible exllamav3 Generator constructor was found for this runtime. "
+                "Model loading and module inspection can still work, but text generation is unavailable."
+            )
 
         max_new_tokens = int(kwargs.get("max_new_tokens", 64))
         output = self.generator.generate(
