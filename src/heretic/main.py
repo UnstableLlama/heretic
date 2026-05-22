@@ -62,8 +62,9 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod
+from .config import Backend, QuantizationMethod
 from .evaluator import Evaluator
+from .exl3_model import Exl3Model
 from .model import AbliterationParameters, Model, get_model_class
 from .reproduce import collect_reproducibles
 from .system import empty_cache, get_accelerator_info
@@ -321,7 +322,10 @@ def run():
         elif choice is None or choice == "":
             return
 
-    model = Model(settings)
+    if settings.backend == Backend.EXL3:
+        model = Exl3Model(settings)
+    else:
+        model = Model(settings)
     print()
     print_memory_usage()
 
@@ -793,6 +797,13 @@ def run():
                             if not save_directory:
                                 continue
 
+                            if settings.backend == Backend.EXL3:
+                                # EXL3 can't merge LoRA into quantized storage; always save adapter sidecar.
+                                print("Saving LoRA adapter (EXL3 backend)...")
+                                model.save_adapter(save_directory)
+                                print(f"Model saved to [bold]{save_directory}[/].")
+                                continue
+
                             strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 continue
@@ -851,9 +862,12 @@ def run():
                                 continue
                             private = visibility == "Private"
 
-                            strategy = obtain_merge_strategy(settings, model)
-                            if strategy is None:
-                                continue
+                            if settings.backend == Backend.EXL3:
+                                strategy = "adapter"
+                            else:
+                                strategy = obtain_merge_strategy(settings, model)
+                                if strategy is None:
+                                    continue
 
                             # Reproducibility requires that the model and all datasets
                             # are available on the Hugging Face Hub (not local paths).
@@ -901,12 +915,25 @@ def run():
 
                             if strategy == "adapter":
                                 print("Uploading LoRA adapter...")
-                                model.model.push_to_hub(
-                                    repo_id,
-                                    private=private,
-                                    max_shard_size=settings.max_shard_size,
-                                    token=token,
-                                )
+                                if settings.backend == Backend.EXL3:
+                                    import tempfile
+                                    with tempfile.TemporaryDirectory() as tmp:
+                                        model.save_adapter(tmp)
+                                        huggingface_hub.create_repo(
+                                            repo_id, private=private, token=token, exist_ok=True
+                                        )
+                                        huggingface_hub.upload_folder(
+                                            folder_path=tmp,
+                                            repo_id=repo_id,
+                                            token=token,
+                                        )
+                                else:
+                                    model.model.push_to_hub(
+                                        repo_id,
+                                        private=private,
+                                        max_shard_size=settings.max_shard_size,
+                                        token=token,
+                                    )
                             else:
                                 print("Uploading merged model...")
                                 merged_model = model.get_merged_model()
