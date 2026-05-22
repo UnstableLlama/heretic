@@ -723,6 +723,27 @@ class Exl3Model:
             )
         return self._generator
 
+    def _greedy_sampler(self) -> Any:
+        """Return a GreedySampler instance. Mirrors HF's do_sample=False
+        on the HF backend: pure argmax, no RNG involvement, so repeated
+        calls with identical weights produce identical outputs."""
+        if getattr(self, "_sampler_cached", None) is None:
+            # GreedySampler lives in exllamav3.generator.sampler.presets
+            # (re-exported as exllamav3.generator.sampler.*).
+            for module_name in (
+                "exllamav3.generator.sampler.presets",
+                "exllamav3.generator.sampler",
+            ):
+                with suppress(ImportError, AttributeError):
+                    mod = importlib.import_module(module_name)
+                    self._sampler_cached = mod.GreedySampler()
+                    break
+            if getattr(self, "_sampler_cached", None) is None:
+                raise RuntimeError(
+                    "Could not locate exllamav3.generator.sampler.GreedySampler."
+                )
+        return self._sampler_cached
+
     def _render_chat_prompts(self, prompts: list[Prompt]) -> list[str]:
         chats = [
             [
@@ -755,11 +776,15 @@ class Exl3Model:
         # Generator.generate(list[str], ...) -> list[str] (completions only,
         # not including the prompt) when completion_only=True (default in
         # examples). We re-tokenize to recover ids.
+        # Pin the sampler to GreedySampler so repeated calls under the same
+        # weights produce identical outputs (matches HF's do_sample=False).
         completions = generator.generate(
             prompt=chat_prompts,
             max_new_tokens=max_new_tokens,
             completion_only=True,
             add_bos=True,
+            sampler=self._greedy_sampler(),
+            seed=0,
         )
         if isinstance(completions, str):
             completions = [completions]
@@ -809,6 +834,8 @@ class Exl3Model:
             max_new_tokens=self.settings.max_response_length,
             completion_only=True,
             add_bos=True,
+            sampler=self._greedy_sampler(),
+            seed=0,
         )
         if isinstance(completion, list):
             completion = completion[0]
