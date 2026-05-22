@@ -72,19 +72,28 @@ def main() -> int:
         "failure_category": None,
     }
 
+    # heretic.Settings uses pydantic-settings' CliSettingsSource which
+    # re-reads sys.argv at construction time. Blank it around the call
+    # so the script's own argparse args don't collide.
+    import sys as _sys
+    _orig_argv = _sys.argv
+    _sys.argv = [_orig_argv[0]]
     try:
-        settings = Settings(
-            model=args.model_path,
-            backend=Backend.EXL3,
-            exl3_max_num_tokens=args.max_num_tokens,
-            row_normalization=RowNormalization.NONE,
-            batch_size=1,
-        )
-    except Exception as error:
-        result["failure_category"] = "settings_error"
-        result["error"] = str(error)
-        _write_output(result, args.out)
-        return 2
+        try:
+            settings = Settings(
+                model=args.model_path,
+                backend=Backend.EXL3,
+                exl3_max_num_tokens=args.max_num_tokens,
+                row_normalization=RowNormalization.NONE,
+                batch_size=1,
+            )
+        except Exception as error:
+            result["failure_category"] = "settings_error"
+            result["error"] = str(error)
+            _write_output(result, args.out)
+            return 2
+    finally:
+        _sys.argv = _orig_argv
 
     try:
         model = Exl3Model(settings)

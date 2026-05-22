@@ -38,16 +38,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    # We construct an Exl3Model directly with a synthesized Settings
-    # because the full Settings loader runs CLI parsing.
-    from heretic.config import Backend, Settings
-    from heretic.exl3_model import Exl3Model
+    # heretic.Settings uses pydantic-settings' CliSettingsSource which
+    # re-reads sys.argv at construction time. Blank it around the call
+    # so the script's own argparse args don't collide.
+    import sys as _sys
+    _orig_argv = _sys.argv
+    _sys.argv = [_orig_argv[0]]
+    try:
+        from heretic.config import Backend, Settings
+        from heretic.exl3_model import Exl3Model
 
-    settings = Settings(
-        model=args.model_path,
-        backend=Backend.EXL3,
-        exl3_max_num_tokens=args.max_num_tokens,
-    )
+        settings = Settings(
+            model=args.model_path,
+            backend=Backend.EXL3,
+            exl3_max_num_tokens=args.max_num_tokens,
+        )
+    finally:
+        _sys.argv = _orig_argv
     model = Exl3Model(settings)
 
     # Group target Linears by layer (and component, the way Heretic uses them).
