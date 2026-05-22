@@ -226,3 +226,64 @@ After confirming the latest loader fix works in your runtime:
 4. only then connect Heretic optimization loop through backend calls
 
 This preserves the stop/go sequencing and avoids large refactors before runtime proof.
+
+---
+
+## Session Addendum — Continued EXL3 Runtime Debugging (May 22, 2026, later)
+
+### Why this addendum exists
+
+After the earlier handoff, user-side reruns surfaced additional runtime-specific incompatibilities in `exllamav3` symbol exposure and module metadata shape that were not reproducible in this container.
+
+### Additional user-reported failures and fixes applied
+
+1. **Failure:** strict API check rejected runtime exposing only `Config`, `Model`, `Generator`.
+   - Error seen: unsupported API surface due to missing `Cache`/`Tokenizer`.
+   - **Fix:** relaxed type requirements in `Exl3Backend` so only `Config` + `Model` are mandatory; `Cache`/`Tokenizer`/`Generator` are optional.
+   - Also added best-effort `Generator` constructor probing with multiple kwargs combinations.
+
+2. **Failure:** `inspect_exl3_modules.py` failed at `load_tokenizer(None)` despite successful model load.
+   - **Fix A (backend):** improved `load_tokenizer` messaging and fallback lookup from `generator.tokenizer` and `model.tokenizer`.
+   - **Fix B (script):** removed unconditional tokenizer load from `inspect_exl3_modules.py` because module inspection does not require tokenizer availability.
+
+3. **Failure:** output path write crash when `artifacts/` did not exist.
+   - Error seen: `FileNotFoundError` for `artifacts/exl3_module_map.json`.
+   - **Fix:** create parent directories before writing JSON output.
+
+4. **Failure:** module dump returned generic names (`module_0`..`module_26`) and zero target modules.
+   - **Fix:** expanded module-name extraction logic:
+     - support `model.modules` as `dict` (use keys),
+     - for list entries, probe multiple name-like attributes (`name`, `module_name`, `full_name`, `key`, `path`).
+   - This increases chance of recovering real suffix-bearing module names (`.o_proj`, `.down_proj`), but does not guarantee it for all runtimes.
+
+### Net code changes made during this continuation
+
+- `src/heretic/backends/exl3.py`
+  - optionalized `Cache`/`Tokenizer`/`Generator` type resolution
+  - added multi-signature generator initialization attempts
+  - refined tokenizer fallback/error behavior
+  - improved module container/name extraction heuristics
+- `scripts/inspect_exl3_modules.py`
+  - removed unnecessary tokenizer load call
+  - added output-directory creation prior to file write
+
+### Important accuracy note (no more API guessing)
+
+At this point, continued guessing across undocumented constructor/signature variants is high risk.  
+**Recommended next step is to inspect the exact installed `exllamav3` runtime API on user machine** (and/or official docs/source for that exact version) before further backend changes.
+
+### Suggested fresh-session kickoff checklist
+
+In a new clean session, first collect hard runtime facts:
+
+1. Version/package provenance:
+   - `python -c "import exllamav3, inspect; print(getattr(exllamav3, '__version__', 'unknown')); print(exllamav3.__file__)"`
+2. Public symbols and constructors:
+   - inspect `Config`, `Model`, `Generator`, `Cache`, `Tokenizer` availability and constructor signatures via `inspect.signature(...)`.
+3. Loaded model module-entry structure:
+   - print `type(model.modules)`,
+   - print `type(model.modules[0])` (if list),
+   - print non-private attributes of one module entry.
+4. Confirm whether canonical projection names exist in recovered module names (`.o_proj`, `.down_proj`) or whether a mapping table is required for this runtime.
+
+Then lock a version-specific compatibility shim rather than broad speculative fallbacks.

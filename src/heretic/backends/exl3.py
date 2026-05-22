@@ -175,10 +175,28 @@ class Exl3Backend(ModelBackend):
         if hasattr(self.model, "named_modules"):
             return [name for name, _ in self.model.named_modules()]
 
-        if hasattr(self.model, "modules") and isinstance(self.model.modules, list):
-            return [getattr(module, "name", f"module_{index}") for index, module in enumerate(self.model.modules)]
+        if hasattr(self.model, "modules"):
+            modules_obj = self.model.modules
+
+            if isinstance(modules_obj, dict):
+                return [str(name) for name in modules_obj.keys()]
+
+            if isinstance(modules_obj, list):
+                module_names: list[str] = []
+                for index, module in enumerate(modules_obj):
+                    name = self._get_module_name(module)
+                    module_names.append(name if name is not None else f"module_{index}")
+                return module_names
 
         return []
+
+    @staticmethod
+    def _get_module_name(module: Any) -> str | None:
+        for attr in ("name", "module_name", "full_name", "key", "path"):
+            value = getattr(module, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
 
     def list_target_modules(self) -> list[str]:
         modules = self.list_modules()
