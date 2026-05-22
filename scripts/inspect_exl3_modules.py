@@ -30,7 +30,6 @@ def main() -> int:
 
     backend = Exl3Backend()
     backend.load_model(args.model_path)
-    backend.load_tokenizer(None)
 
     modules = backend.list_modules()
     target_modules = backend.list_target_modules()
@@ -49,7 +48,9 @@ def main() -> int:
     if args.out == "-":
         print(text)
     else:
-        Path(args.out).write_text(text + "\n")
+        output_path = Path(args.out)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text + "\n")
 
     return 0
 
