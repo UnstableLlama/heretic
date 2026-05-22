@@ -30,7 +30,6 @@ def main() -> int:
 
     backend = Exl3Backend()
     backend.load_model(args.model_path)
-    backend.load_tokenizer(None)
 
     modules = backend.list_modules()
     target_modules = backend.list_target_modules()
