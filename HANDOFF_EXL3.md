@@ -1,11 +1,14 @@
 # Heretic EXL3 Integration Handoff
 
-**Status as of latest session:** smoke test passes strictly on Qwen 3.5-2B
-hybrid. First full optimization run got past load / batch-sizing / initial
-refusal counting and then hit a residual-capture failure on hybrid blocks,
-which has now been fixed by wrapping each block's `forward` directly
-(no longer relying on `export_state`). Awaits a fresh full-loop run to
-confirm the rest of the pipeline.
+**Status as of latest session:** EXL3 integration is **working end-to-end**
+on Qwen 3.5-2B hybrid. Smoke test passes strictly; full optimization run
+makes it past load → batch-sizing → initial-refusal counting → per-layer
+residual capture (the previous failure point, now fixed by wrapping each
+block's `forward` directly instead of relying on `export_state`).
+
+**Next session will move to a different part of the repo.** The EXL3
+backend is stable enough to leave for now; remaining EXL3 follow-ups are
+listed under "Open work" below and can be picked up later.
 
 ---
 
@@ -40,24 +43,42 @@ The smoke script output for a passing run:
 }
 ```
 
-## What is in flight (real-loop test running now)
+## Full real-loop run — confirmed working
 
 ```
-PYTHONPATH=src python -m heretic --backend exl3 --row-normalization none \
-    /mnt/two/Weights/Qwen_Qwen3.5-2B/4
+heretic --backend exl3 --row-normalization none /mnt/two/Weights/Qwen_Qwen3.5-2B/4
 ```
 
-Will exercise — for the first time end-to-end against an EXL3 model:
+Confirmed reaching at least:
 
-- batch-size autodetection (`get_responses`)
-- per-layer residual capture (`get_residuals_batched`)
-- logprob computation (`get_logprobs_batched`)
-- the TPE search loop calling `abliterate` and `reset_model` hundreds
-  of times
-- save / upload UI (adapter-sidecar path)
+- Model load + module discovery (24 layers × 2 components = 48 targets)
+- Batch-size autodetection — settled on **128** at ~865 tokens/s on a
+  dual RTX 3090 setup
+- Both prompt corpora load (`mlabonne/harmless_alpaca`,
+  `mlabonne/harmful_behaviors`, 400 + 400 prompts each)
+- First-token probability distributions on the good evaluation set
+- Initial refusal count on the bad evaluation set (**98 / 100** for
+  the unmodified Qwen 3.5-2B baseline)
+- Per-layer residual mean computation on the good prompts (the
+  previous failure point)
 
-User reports it appears to be working. Update this doc with the
-post-run verdict on the next session.
+The previous run died at `get_residuals_mean` with:
+
+```
+RuntimeError: Expected 25 captured residuals, got 1.
+```
+
+This was caused by Qwen 3.5's hybrid block class not honoring
+exllamav3's `export_state` attribute — only the pre-block-0 wrapper
+fired, so we got exactly 1 capture. Fixed in commit `4675ee2` by
+replacing the `export_state` mechanism with explicit per-block
+`forward` wrappers (see "Residual capture — RESOLVED" under Open
+work below for the full write-up).
+
+After the fix, the run proceeds through the residual-mean step on
+both good and bad prompts without error. The TPE search loop and
+save/upload paths are not yet exercised end-to-end but are no longer
+gated on a known-broken upstream behavior.
 
 ---
 
@@ -304,12 +325,40 @@ discovered by running the scripts against a real model.
    different word choices. Fixed by passing `GreedySampler()` +
    `seed=0` explicitly, mirroring HF's hardcoded `do_sample=False`.
 
-The commit log on the `claude/cool-ptolemy-BeiwV` branch tells this
-story commit-by-commit if needed.
+6. **`Expected 25 captured residuals, got 1`** during
+   `get_residuals_mean`. Setting `block.export_state = True` had no
+   effect on Qwen 3.5's hybrid block class, so only the pre-block-0
+   wrapper produced output. Fixed by removing the dependency on
+   `export_state` entirely and instead wrapping each block's
+   `forward` to append its output to `params["export_states"]`
+   ourselves. Block 0's wrapper also captures input so the list
+   starts with post-embedding state. Defensively set
+   `export_state=False` where the attribute exists, to prevent
+   double-capture on architectures whose default might be True.
+   (Commit `4675ee2`.)
+
+The commit log on the `claude/cool-ptolemy-BeiwV` and
+`claude/eager-planck-CLPzk` branches tells this story
+commit-by-commit if needed.
 
 ---
 
-## How to resume
+## Next session: moving on
+
+The EXL3 backend is **leaving the active worklist**. Future
+sessions will pick up a different area of the repo. When EXL3
+work resumes:
+
+1. Open items in priority order: `row_normalization=pre|full`
+   support, then save-UI polish, then cache hygiene verification.
+2. The full optimization run has not yet been driven to completion
+   (TPE loop → save → upload). If something breaks past the
+   residual-mean step, this doc's "Open work" section is the first
+   place to look.
+
+---
+
+## How to resume (general)
 
 If you're picking this up fresh:
 
@@ -323,4 +372,4 @@ If you're picking this up fresh:
    that is what closes the loop.
 4. If the full run from the last session finished, the next thing to
    try is the save path. If it failed mid-loop, the failure trace
-   should point at one of the four "open work" items above.
+   should point at one of the open-work items above.
