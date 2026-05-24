@@ -61,7 +61,7 @@ def _write_output(payload: dict, path: str) -> None:
 def main() -> int:
     args = parse_args()
 
-    from heretic.config import Backend, RowNormalization, Settings
+    from heretic.config import QuantizationMethod, RowNormalization, Settings
     from heretic.exl3_model import AbliterationParameters, Exl3Model
 
     result: dict = {
@@ -82,7 +82,7 @@ def main() -> int:
         try:
             settings = Settings(
                 model=args.model_path,
-                backend=Backend.EXL3,
+                quantization=QuantizationMethod.EXL3,
                 exl3_max_num_tokens=args.max_num_tokens,
                 row_normalization=RowNormalization.NONE,
                 batch_size=1,
