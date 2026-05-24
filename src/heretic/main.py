@@ -801,6 +801,8 @@ def run():
                             if strategy is None:
                                 continue
 
+                            merge_output_directory = save_directory
+
                             if strategy == "adapter":
                                 print("Saving LoRA adapter...")
                                 if settings.quantization == QuantizationMethod.EXL3:
@@ -812,6 +814,7 @@ def run():
                                     )
                             else:
                                 print("Saving merged model...")
+                                merge_output_directory = save_directory
                                 if settings.quantization == QuantizationMethod.EXL3:
                                     base_model = prompt_text(
                                         "Base HF model to merge into:",
@@ -820,17 +823,46 @@ def run():
                                     if not base_model:
                                         continue
                                     settings.exl3_base_model = base_model
+
+                                    merge_output_directory = prompt_path(
+                                        "Path to save merged model tensors:"
+                                    )
+                                    if not merge_output_directory:
+                                        continue
+
                                 merged_model = model.get_merged_model()
-                                merged_model.save_pretrained(
-                                    save_directory,
-                                    max_shard_size=settings.max_shard_size,
-                                )
+
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    import shutil
+                                    import tempfile
+                                    from pathlib import Path
+
+                                    out_dir = Path(merge_output_directory)
+                                    out_dir.mkdir(parents=True, exist_ok=True)
+                                    with tempfile.TemporaryDirectory() as tmp:
+                                        merged_model.save_pretrained(
+                                            tmp,
+                                            max_shard_size=settings.max_shard_size,
+                                        )
+                                        model.tokenizer.save_pretrained(tmp)
+
+                                        for source in Path(tmp).iterdir():
+                                            target_name = source.name
+                                            if source.name == "model.safetensors" and (out_dir / source.name).exists():
+                                                target_name = "merged-model.safetensors"
+                                            shutil.copy2(source, out_dir / target_name)
+                                else:
+                                    merged_model.save_pretrained(
+                                        merge_output_directory,
+                                        max_shard_size=settings.max_shard_size,
+                                    )
+                                    model.tokenizer.save_pretrained(merge_output_directory)
+
                                 del merged_model
                                 empty_cache()
-                                model.tokenizer.save_pretrained(save_directory)
                                 reset_trial_model()
 
-                            print(f"Model saved to [bold]{save_directory}[/].")
+                            print(f"Model saved to [bold]{merge_output_directory}[/].")
 
                         case "Upload the model to Hugging Face":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
