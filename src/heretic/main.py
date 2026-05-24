@@ -62,7 +62,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import Backend, QuantizationMethod
+from .config import QuantizationMethod
 from .evaluator import Evaluator
 from .exl3_model import Exl3Model
 from .model import AbliterationParameters, Model, get_model_class
@@ -322,7 +322,7 @@ def run():
         elif choice is None or choice == "":
             return
 
-    if settings.backend == Backend.EXL3:
+    if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)
     else:
         model = Model(settings)
@@ -797,9 +797,9 @@ def run():
                             if not save_directory:
                                 continue
 
-                            if settings.backend == Backend.EXL3:
+                            if settings.quantization == QuantizationMethod.EXL3:
                                 # EXL3 can't merge LoRA into quantized storage; always save adapter sidecar.
-                                print("Saving LoRA adapter (EXL3 backend)...")
+                                print("Saving LoRA adapter (EXL3 quantization mode)...")
                                 model.save_adapter(save_directory)
                                 print(f"Model saved to [bold]{save_directory}[/].")
                                 continue
@@ -862,7 +862,7 @@ def run():
                                 continue
                             private = visibility == "Private"
 
-                            if settings.backend == Backend.EXL3:
+                            if settings.quantization == QuantizationMethod.EXL3:
                                 strategy = "adapter"
                             else:
                                 strategy = obtain_merge_strategy(settings, model)
@@ -915,7 +915,7 @@ def run():
 
                             if strategy == "adapter":
                                 print("Uploading LoRA adapter...")
-                                if settings.backend == Backend.EXL3:
+                                if settings.quantization == QuantizationMethod.EXL3:
                                     import tempfile
                                     with tempfile.TemporaryDirectory() as tmp:
                                         model.save_adapter(tmp)
