@@ -858,16 +858,35 @@ class Exl3Model:
     # Save: PEFT-format LoRA adapter sidecar
     # ------------------------------------------------------------------
 
-    def get_merged_model(self) -> Any:
-        """EXL3 doesn't support baking LoRA back into the quantized
-        storage. The save UI in main.py should branch on backend and
-        offer adapter-only saving for EXL3.
+    def get_merged_model(self, base_model: str | None = None) -> Any:
+        """Merge the current EXL3 LoRA adapter into the original HF base model.
+
+        EXL3 quantized weights themselves cannot be modified in-place, so this
+        path exports the current adapter, loads the original HF base model,
+        attaches the adapter with PEFT, and returns ``merge_and_unload()``.
         """
-        raise NotImplementedError(
-            "EXL3 weights cannot be merged in-place. Save the LoRA adapter "
-            "sidecar (heretic offers this path for the EXL3 backend), or "
-            "re-quantize the merged model manually."
-        )
+        import tempfile
+
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+        hf_base = base_model or self._hf_base_model_name()
+        model_class = AutoModelForImageTextToText if self._is_multimodal() else AutoModelForCausalLM
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.save_adapter(tmp)
+            print("* Loading base model for merge (this may take a while)...")
+            base_model = model_class.from_pretrained(
+                hf_base,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+                trust_remote_code=bool(self.settings.trust_remote_code),
+            )
+            print("* Applying LoRA adapter...")
+            peft_model = PeftModel.from_pretrained(base_model, tmp)
+            print("* Merging LoRA adapter into base model...")
+            return peft_model.merge_and_unload()
 
     def _is_multimodal(self) -> bool:
         """Check whether the model uses a multimodal wrapper (i.e. module
@@ -878,6 +897,10 @@ class Exl3Model:
         return any(
             ".language_model." in key for key in self._all_module_keys
         )
+
+    def get_base_model_hint(self) -> str:
+        """Return best-effort HF base model hint for EXL3 merge prompts."""
+        return self._hf_base_model_name()
 
     def _hf_base_model_name(self) -> str:
         """Best-effort lookup for the original HF model name. Falls back
