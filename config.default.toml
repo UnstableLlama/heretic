@@ -18,7 +18,8 @@ dtypes = [
 
 # Quantization method to use when loading the model. Options:
 # "none" (no quantization),
-# "bnb_4bit" (4-bit quantization using bitsandbytes).
+# "bnb_4bit" (4-bit quantization using bitsandbytes),
+# "exl3" (ExLlamaV3 for EXL3-quantized models; requires heretic-llm[exl3]).
 quantization = "none"
 
 # Device map to pass to Accelerate when loading the model.

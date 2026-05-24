@@ -20,14 +20,10 @@ from pydantic_settings import (
 # exclude=True set in their field definitions if appropriate.
 
 
-class Backend(str, Enum):
-    HF = "hf"
-    EXL3 = "exl3"
-
-
 class QuantizationMethod(str, Enum):
     NONE = "none"
     BNB_4BIT = "bnb_4bit"
+    EXL3 = "exl3"
 
 
 class RowNormalization(str, Enum):
@@ -94,15 +90,6 @@ class BenchmarkSpecification(BaseModel):
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
-    backend: Backend = Field(
-        default=Backend.HF,
-        description=(
-            "Model runtime backend. Options: "
-            '"hf" (HuggingFace Transformers + optional bitsandbytes, default), '
-            '"exl3" (ExLlamaV3 for EXL3-quantized models; requires "pip install heretic-llm[exl3]" '
-            'and a path to an EXL3 model directory).'
-        ),
-    )
 
     exl3_max_num_tokens: int = Field(
         default=8192,
@@ -160,7 +147,8 @@ class Settings(BaseSettings):
         description=(
             "Quantization method to use when loading the model. Options: "
             '"none" (no quantization), '
-            '"bnb_4bit" (4-bit quantization using bitsandbytes).'
+            '"bnb_4bit" (4-bit quantization using bitsandbytes), '
+            '"exl3" (ExLlamaV3 for EXL3-quantized models; requires "pip install heretic-llm[exl3]" and a path to an EXL3 model directory).'
         ),
     )
 

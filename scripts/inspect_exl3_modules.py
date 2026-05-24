@@ -45,12 +45,12 @@ def main() -> int:
     _orig_argv = _sys.argv
     _sys.argv = [_orig_argv[0]]
     try:
-        from heretic.config import Backend, Settings
+        from heretic.config import QuantizationMethod, Settings
         from heretic.exl3_model import Exl3Model
 
         settings = Settings(
             model=args.model_path,
-            backend=Backend.EXL3,
+            quantization=QuantizationMethod.EXL3,
             exl3_max_num_tokens=args.max_num_tokens,
         )
     finally:
