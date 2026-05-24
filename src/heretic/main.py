@@ -62,7 +62,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import Backend, QuantizationMethod
+from .config import QuantizationMethod
 from .evaluator import Evaluator
 from .exl3_model import Exl3Model
 from .model import AbliterationParameters, Model, get_model_class
@@ -322,7 +322,7 @@ def run():
         elif choice is None or choice == "":
             return
 
-    if settings.backend == Backend.EXL3:
+    if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)
     else:
         model = Model(settings)
@@ -797,26 +797,31 @@ def run():
                             if not save_directory:
                                 continue
 
-                            if settings.backend == Backend.EXL3:
-                                # EXL3 can't merge LoRA into quantized storage; always save adapter sidecar.
-                                print("Saving LoRA adapter (EXL3 backend)...")
-                                model.save_adapter(save_directory)
-                                print(f"Model saved to [bold]{save_directory}[/].")
-                                continue
-
                             strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 continue
 
                             if strategy == "adapter":
                                 print("Saving LoRA adapter...")
-                                model.model.save_pretrained(
-                                    save_directory,
-                                    max_shard_size=settings.max_shard_size,
-                                )
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    model.save_adapter(save_directory)
+                                else:
+                                    model.model.save_pretrained(
+                                        save_directory,
+                                        max_shard_size=settings.max_shard_size,
+                                    )
                             else:
                                 print("Saving merged model...")
-                                merged_model = model.get_merged_model()
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    base_model = prompt_text(
+                                        "Base HF model to merge into:",
+                                        default=model.get_base_model_hint(),
+                                    )
+                                    if not base_model:
+                                        continue
+                                    merged_model = model.get_merged_model(base_model=base_model)
+                                else:
+                                    merged_model = model.get_merged_model()
                                 merged_model.save_pretrained(
                                     save_directory,
                                     max_shard_size=settings.max_shard_size,
@@ -862,12 +867,9 @@ def run():
                                 continue
                             private = visibility == "Private"
 
-                            if settings.backend == Backend.EXL3:
-                                strategy = "adapter"
-                            else:
-                                strategy = obtain_merge_strategy(settings, model)
-                                if strategy is None:
-                                    continue
+                            strategy = obtain_merge_strategy(settings, model)
+                            if strategy is None:
+                                continue
 
                             # Reproducibility requires that the model and all datasets
                             # are available on the Hugging Face Hub (not local paths).
@@ -915,7 +917,7 @@ def run():
 
                             if strategy == "adapter":
                                 print("Uploading LoRA adapter...")
-                                if settings.backend == Backend.EXL3:
+                                if settings.quantization == QuantizationMethod.EXL3:
                                     import tempfile
                                     with tempfile.TemporaryDirectory() as tmp:
                                         model.save_adapter(tmp)
@@ -936,7 +938,16 @@ def run():
                                     )
                             else:
                                 print("Uploading merged model...")
-                                merged_model = model.get_merged_model()
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    base_model = prompt_text(
+                                        "Base HF model to merge into:",
+                                        default=model.get_base_model_hint(),
+                                    )
+                                    if not base_model:
+                                        continue
+                                    merged_model = model.get_merged_model(base_model=base_model)
+                                else:
+                                    merged_model = model.get_merged_model()
                                 merged_model.push_to_hub(
                                     repo_id,
                                     private=private,
