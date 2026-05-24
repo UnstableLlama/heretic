@@ -869,6 +869,30 @@ class Exl3Model:
             "re-quantize the merged model manually."
         )
 
+    def _is_multimodal(self) -> bool:
+        """Check whether the model uses a multimodal wrapper (i.e. module
+        keys contain a ``language_model`` segment). Multimodal models must
+        be loaded with ``AutoModelForImageTextToText`` when merging the
+        adapter back into HF weights.
+        """
+        return any(
+            ".language_model." in key for key in self._all_module_keys
+        )
+
+    def _hf_base_model_name(self) -> str:
+        """Best-effort lookup for the original HF model name. Falls back
+        to the EXL3 quant path if nothing better is available.
+        """
+        model_dir = Path(self.settings.model).expanduser()
+        config_path = model_dir / "config.json"
+        if config_path.exists():
+            with suppress(Exception):
+                cfg = json.loads(config_path.read_text())
+                name = cfg.get("_name_or_path", "")
+                if name:
+                    return name
+        return self.settings.model
+
     def save_adapter(self, save_directory: str) -> None:
         """Write a PEFT-format LoRA adapter dir compatible with both the
         peft library and exllamav3's own LoRA.from_directory.
@@ -876,6 +900,7 @@ class Exl3Model:
         Output:
             <save_directory>/adapter_config.json
             <save_directory>/adapter_model.safetensors
+            <save_directory>/merge.py  (ready-to-use merge script)
 
         Tensor keys are
             base_model.model.<full_key>.lora_A.weight  shape (rank, in_unpad)
@@ -921,11 +946,14 @@ class Exl3Model:
                         leaf = module.key.rsplit(".", 3)[-3]
                     target_module_names.add(leaf)
 
+        multimodal = self._is_multimodal()
+        hf_base = self._hf_base_model_name()
+
         rank = 1  # We only allocate rank-1 slots in this backend.
         adapter_config = {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": self.settings.model,
+            "base_model_name_or_path": hf_base,
             "r": rank,
             "lora_alpha": rank,
             "lora_dropout": 0.0,
@@ -933,6 +961,7 @@ class Exl3Model:
             "target_modules": sorted(target_module_names),
             "fan_in_fan_out": False,
             "inference_mode": True,
+            "heretic_multimodal": multimodal,
         }
         (out_dir / "adapter_config.json").write_text(
             json.dumps(adapter_config, indent=2) + "\n"
@@ -948,4 +977,63 @@ class Exl3Model:
                 with suppress(Exception):
                     shutil.copy2(sp, out_dir / fname)
 
+        # Write a ready-to-use merge script so users don't have to guess
+        # which AutoModel class to use (this is the #1 pitfall for EXL3
+        # adapters on multimodal models like Qwen 3.5).
+        model_class = (
+            "AutoModelForImageTextToText" if multimodal
+            else "AutoModelForCausalLM"
+        )
+        merge_script = (
+            "#!/usr/bin/env python3\n"
+            '"""Merge this Heretic EXL3 adapter into a full-precision HF model.\n'
+            "\n"
+            "Usage:\n"
+            "    python merge.py --base <HF_MODEL> --output <OUTPUT_DIR>\n"
+            "\n"
+            "The --base argument should point to the original (unquantized)\n"
+            "HuggingFace model that the EXL3 quant was derived from.\n"
+            '"""\n'
+            "\n"
+            "import argparse\n"
+            "from pathlib import Path\n"
+            "\n"
+            "import torch\n"
+            f"from transformers import {model_class}, AutoTokenizer\n"
+            "from peft import PeftModel\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            f'    parser.add_argument("--base", default={hf_base!r})\n'
+            '    parser.add_argument("--output", required=True)\n'
+            '    parser.add_argument("--dtype", default="bfloat16")\n'
+            "    args = parser.parse_args()\n"
+            "\n"
+            "    dtype = getattr(torch, args.dtype)\n"
+            "    adapter_dir = str(Path(__file__).resolve().parent)\n"
+            "\n"
+            f"    model = {model_class}.from_pretrained(\n"
+            '        args.base, torch_dtype=dtype, device_map="auto",\n'
+            "    )\n"
+            "    model = PeftModel.from_pretrained(model, adapter_dir)\n"
+            "    merged = model.merge_and_unload()\n"
+            "\n"
+            "    merged.save_pretrained(args.output, safe_serialization=True)\n"
+            "    AutoTokenizer.from_pretrained(args.base).save_pretrained(args.output)\n"
+            '    print(f"Saved merged model to {args.output}")\n'
+            "\n"
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    main()\n"
+        )
+        (out_dir / "merge.py").write_text(merge_script)
+
         print(f"* Wrote PEFT adapter to [bold]{out_dir}[/]")
+        if multimodal:
+            print(
+                f"* [yellow]Note:[/] This model uses a multimodal architecture. "
+                f"When merging, load the base model with "
+                f"[bold]{model_class}[/], not AutoModelForCausalLM."
+            )
+        print(f"* A ready-to-use merge script was written to [bold]{out_dir}/merge.py[/]")

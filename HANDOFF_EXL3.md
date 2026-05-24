@@ -227,6 +227,29 @@ are doable but cost VRAM and trial-time, and aren't needed for a
 first working integration. Users get `none` by passing
 `--row-normalization none` (or setting it in `config.toml`).
 
+### Adapter merge pitfall on multimodal models — RESOLVED
+
+The EXL3 adapter saves tensor keys using exllamav3's module
+naming, which includes a `language_model` segment for multimodal
+architectures (e.g. Qwen 3.5):
+
+    base_model.model.model.language_model.layers.0.self_attn.o_proj.lora_A.weight
+
+If users merge the adapter against the base HF model loaded with
+`AutoModelForCausalLM`, the module paths are
+`model.layers.0.self_attn.o_proj` (no `language_model`), causing a
+complete key mismatch. PEFT silently drops every weight, the merge
+has zero effect, and the output model is unchanged.
+
+Fixed by:
+- Detecting multimodal models (keys containing `.language_model.`)
+- Writing a ready-to-use `merge.py` script in the adapter directory
+  that uses the correct `AutoModelForImageTextToText` class
+- Printing a warning at save time about which model class to use
+- Setting `base_model_name_or_path` to the original HF model name
+  (read from config.json `_name_or_path`) instead of the EXL3
+  quant directory path
+
 ### Save UI quality-of-life
 
 The save prompt still shows the merge/adapter strategy chooser on
