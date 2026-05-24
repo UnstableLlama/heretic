@@ -62,7 +62,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import Backend, QuantizationMethod
+from .config import QuantizationMethod
 from .evaluator import Evaluator
 from .exl3_model import Exl3Model
 from .model import AbliterationParameters, Model, get_model_class
@@ -322,7 +322,7 @@ def run():
         elif choice is None or choice == "":
             return
 
-    if settings.backend == Backend.EXL3:
+    if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)
     else:
         model = Model(settings)
@@ -797,36 +797,72 @@ def run():
                             if not save_directory:
                                 continue
 
-                            if settings.backend == Backend.EXL3:
-                                # EXL3 can't merge LoRA into quantized storage; always save adapter sidecar.
-                                print("Saving LoRA adapter (EXL3 backend)...")
-                                model.save_adapter(save_directory)
-                                print(f"Model saved to [bold]{save_directory}[/].")
-                                continue
-
                             strategy = obtain_merge_strategy(settings, model)
                             if strategy is None:
                                 continue
 
+                            merge_output_directory = save_directory
+
                             if strategy == "adapter":
                                 print("Saving LoRA adapter...")
-                                model.model.save_pretrained(
-                                    save_directory,
-                                    max_shard_size=settings.max_shard_size,
-                                )
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    model.save_adapter(save_directory)
+                                else:
+                                    model.model.save_pretrained(
+                                        save_directory,
+                                        max_shard_size=settings.max_shard_size,
+                                    )
                             else:
                                 print("Saving merged model...")
+                                merge_output_directory = save_directory
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    base_model = prompt_text(
+                                        "Base HF model to merge into:",
+                                        default=settings.exl3_base_model or model.get_base_model_hint(),
+                                    )
+                                    if not base_model:
+                                        continue
+                                    settings.exl3_base_model = base_model
+
+                                    merge_output_directory = prompt_path(
+                                        "Path to save merged model tensors:"
+                                    )
+                                    if not merge_output_directory:
+                                        continue
+
                                 merged_model = model.get_merged_model()
-                                merged_model.save_pretrained(
-                                    save_directory,
-                                    max_shard_size=settings.max_shard_size,
-                                )
+
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    import shutil
+                                    import tempfile
+                                    from pathlib import Path
+
+                                    out_dir = Path(merge_output_directory)
+                                    out_dir.mkdir(parents=True, exist_ok=True)
+                                    with tempfile.TemporaryDirectory() as tmp:
+                                        merged_model.save_pretrained(
+                                            tmp,
+                                            max_shard_size=settings.max_shard_size,
+                                        )
+                                        model.tokenizer.save_pretrained(tmp)
+
+                                        for source in Path(tmp).iterdir():
+                                            target_name = source.name
+                                            if source.name == "model.safetensors" and (out_dir / source.name).exists():
+                                                target_name = "merged-model.safetensors"
+                                            shutil.copy2(source, out_dir / target_name)
+                                else:
+                                    merged_model.save_pretrained(
+                                        merge_output_directory,
+                                        max_shard_size=settings.max_shard_size,
+                                    )
+                                    model.tokenizer.save_pretrained(merge_output_directory)
+
                                 del merged_model
                                 empty_cache()
-                                model.tokenizer.save_pretrained(save_directory)
                                 reset_trial_model()
 
-                            print(f"Model saved to [bold]{save_directory}[/].")
+                            print(f"Model saved to [bold]{merge_output_directory}[/].")
 
                         case "Upload the model to Hugging Face":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
@@ -862,12 +898,9 @@ def run():
                                 continue
                             private = visibility == "Private"
 
-                            if settings.backend == Backend.EXL3:
-                                strategy = "adapter"
-                            else:
-                                strategy = obtain_merge_strategy(settings, model)
-                                if strategy is None:
-                                    continue
+                            strategy = obtain_merge_strategy(settings, model)
+                            if strategy is None:
+                                continue
 
                             # Reproducibility requires that the model and all datasets
                             # are available on the Hugging Face Hub (not local paths).
@@ -915,7 +948,7 @@ def run():
 
                             if strategy == "adapter":
                                 print("Uploading LoRA adapter...")
-                                if settings.backend == Backend.EXL3:
+                                if settings.quantization == QuantizationMethod.EXL3:
                                     import tempfile
                                     with tempfile.TemporaryDirectory() as tmp:
                                         model.save_adapter(tmp)
@@ -936,6 +969,14 @@ def run():
                                     )
                             else:
                                 print("Uploading merged model...")
+                                if settings.quantization == QuantizationMethod.EXL3:
+                                    base_model = prompt_text(
+                                        "Base HF model to merge into:",
+                                        default=settings.exl3_base_model or model.get_base_model_hint(),
+                                    )
+                                    if not base_model:
+                                        continue
+                                    settings.exl3_base_model = base_model
                                 merged_model = model.get_merged_model()
                                 merged_model.push_to_hub(
                                     repo_id,
