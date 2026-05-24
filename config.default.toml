@@ -18,8 +18,13 @@ dtypes = [
 
 # Quantization method to use when loading the model. Options:
 # "none" (no quantization),
-# "bnb_4bit" (4-bit quantization using bitsandbytes).
+# "bnb_4bit" (4-bit quantization using bitsandbytes),
+# "exl3" (ExLlamaV3 for EXL3-quantized models; requires heretic-llm[exl3]).
 quantization = "none"
+
+# EXL3 merge only: explicit HF base model ID/path to merge into.
+# If unset, Heretic infers from EXL3 model directory metadata.
+# exl3_base_model = "meta-llama/Llama-3.2-1B-Instruct"
 
 # Device map to pass to Accelerate when loading the model.
 device_map = "auto"

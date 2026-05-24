@@ -2,8 +2,9 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import math
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Type, cast
 
 import bitsandbytes as bnb
@@ -52,6 +53,35 @@ class AbliterationParameters:
     min_weight: float
     min_weight_distance: float
 
+
+
+
+@contextmanager
+def _temporarily_hide_local_adapter_files(model_path: str):
+    """Prevent PEFT auto-loading when a local base-model directory also contains
+    adapter artifacts (e.g. adapter_config.json).
+
+    Transformers + PEFT may auto-wrap such directories as PeftModel, which then
+    collides with Heretic's own LoRA attachment flow.
+    """
+    path = Path(model_path).expanduser()
+    if not path.is_dir():
+        yield
+        return
+
+    renamed: list[tuple[Path, Path]] = []
+    try:
+        for name in ("adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"):
+            src = path / name
+            if src.exists():
+                dst = path / f".{name}.heretic-hidden"
+                src.rename(dst)
+                renamed.append((dst, src))
+        yield
+    finally:
+        for src, dst in reversed(renamed):
+            if src.exists() and not dst.exists():
+                src.rename(dst)
 
 class Model:
     model: PreTrainedModel | PeftModel
@@ -107,15 +137,16 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                self.model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **self.revision_kwargs,
-                    **extra_kwargs,
-                )
+                with _temporarily_hide_local_adapter_files(settings.model):
+                    self.model = get_model_class(settings.model).from_pretrained(
+                        settings.model,
+                        dtype=dtype,
+                        device_map=settings.device_map,
+                        max_memory=self.max_memory,
+                        trust_remote_code=self.trusted_models.get(settings.model),
+                        **self.revision_kwargs,
+                        **extra_kwargs,
+                    )
 
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
@@ -260,13 +291,14 @@ class Model:
 
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
-            base_model = get_model_class(self.settings.model).from_pretrained(
-                self.settings.model,
-                torch_dtype=self.model.dtype,
-                device_map="cpu",
-                trust_remote_code=self.trusted_models.get(self.settings.model),
-                **self.revision_kwargs,
-            )
+            with _temporarily_hide_local_adapter_files(self.settings.model):
+                base_model = get_model_class(self.settings.model).from_pretrained(
+                    self.settings.model,
+                    torch_dtype=self.model.dtype,
+                    device_map="cpu",
+                    trust_remote_code=self.trusted_models.get(self.settings.model),
+                    **self.revision_kwargs,
+                )
 
             # Apply LoRA adapters to the CPU model
             print("* Applying LoRA adapters...")
@@ -321,15 +353,16 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        self.model = get_model_class(self.settings.model).from_pretrained(
-            self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **self.revision_kwargs,
-            **extra_kwargs,
-        )
+        with _temporarily_hide_local_adapter_files(self.settings.model):
+            self.model = get_model_class(self.settings.model).from_pretrained(
+                self.settings.model,
+                dtype=dtype,
+                device_map=self.settings.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=self.trusted_models.get(self.settings.model),
+                **self.revision_kwargs,
+                **extra_kwargs,
+            )
 
         self._apply_lora()
 
