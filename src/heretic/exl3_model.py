@@ -858,35 +858,67 @@ class Exl3Model:
     # Save: PEFT-format LoRA adapter sidecar
     # ------------------------------------------------------------------
 
-    def get_merged_model(self, base_model: str | None = None) -> Any:
+    def get_merged_model(self) -> Any:
         """Merge the current EXL3 LoRA adapter into the original HF base model.
 
         EXL3 quantized weights themselves cannot be modified in-place, so this
         path exports the current adapter, loads the original HF base model,
         attaches the adapter with PEFT, and returns ``merge_and_unload()``.
         """
-        import tempfile
-
         import torch
-        from peft import PeftModel
+        from peft import LoraConfig, get_peft_model
         from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
-        hf_base = base_model or self._hf_base_model_name()
-        model_class = AutoModelForImageTextToText if self._is_multimodal() else AutoModelForCausalLM
+        hf_base = self.settings.exl3_base_model or self._hf_base_model_name()
+        model_class = (
+            AutoModelForImageTextToText if self._is_multimodal() else AutoModelForCausalLM
+        )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            self.save_adapter(tmp)
-            print("* Loading base model for merge (this may take a while)...")
-            base_model = model_class.from_pretrained(
-                hf_base,
-                torch_dtype=torch.bfloat16,
-                device_map="cpu",
-                trust_remote_code=bool(self.settings.trust_remote_code),
-            )
-            print("* Applying LoRA adapter...")
-            peft_model = PeftModel.from_pretrained(base_model, tmp)
-            print("* Merging LoRA adapter into base model...")
-            return peft_model.merge_and_unload()
+        print("* Loading base model on CPU (this may take a while)...")
+        base_model = model_class.from_pretrained(
+            hf_base,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            trust_remote_code=bool(self.settings.trust_remote_code),
+        )
+
+        target_module_names: set[str] = set()
+        adapter_state: dict[str, Tensor] = {}
+        for per_layer in self._layer_modules:
+            for modules in per_layer.values():
+                for module in modules:
+                    in_u = module.in_features_unpadded
+                    out_u = module.out_features_unpadded
+                    a = module.lora_a_tensors[self._lora_key]
+                    b = module.lora_b_tensors[self._lora_key]
+                    a_peft = a[:in_u, :].T.contiguous().cpu()
+                    b_peft = b[:, :out_u].T.contiguous().cpu()
+                    leaf = module.key.rsplit(".", 1)[-1]
+                    if leaf.startswith("slice"):
+                        leaf = module.key.rsplit(".", 3)[-3]
+                    target_module_names.add(leaf)
+                    base_key = f"base_model.model.{module.key}"
+                    adapter_state[f"{base_key}.lora_A.weight"] = a_peft
+                    adapter_state[f"{base_key}.lora_B.weight"] = b_peft
+
+        peft_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=1,
+            lora_alpha=1,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=sorted(target_module_names),
+            inference_mode=True,
+        )
+
+        print("* Applying LoRA adapters...")
+        peft_model = get_peft_model(base_model, peft_config)
+        for name, param in peft_model.named_parameters():
+            if name in adapter_state:
+                param.data = adapter_state[name].to(param.device)
+
+        print("* Merging LoRA adapters into base model...")
+        return peft_model.merge_and_unload()
 
     def _is_multimodal(self) -> bool:
         """Check whether the model uses a multimodal wrapper (i.e. module
@@ -900,7 +932,7 @@ class Exl3Model:
 
     def get_base_model_hint(self) -> str:
         """Return best-effort HF base model hint for EXL3 merge prompts."""
-        return self._hf_base_model_name()
+        return self.settings.exl3_base_model or self._hf_base_model_name()
 
     def _hf_base_model_name(self) -> str:
         """Best-effort lookup for the original HF model name. Falls back

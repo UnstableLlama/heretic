@@ -99,6 +99,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    exl3_base_model: str | None = Field(
+        default=None,
+        description=(
+            "EXL3 merge only: explicit Hugging Face base model ID/path to use when "
+            "merging LoRA into a full model. If not set, Heretic will try to infer "
+            "it from the EXL3 model directory metadata."
+        ),
+    )
+
     model_commit: str | None = Field(
         default=None,
         description="Hugging Face commit hash of the model.",

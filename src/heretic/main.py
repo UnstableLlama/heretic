@@ -815,13 +815,12 @@ def run():
                                 if settings.quantization == QuantizationMethod.EXL3:
                                     base_model = prompt_text(
                                         "Base HF model to merge into:",
-                                        default=model.get_base_model_hint(),
+                                        default=settings.exl3_base_model or model.get_base_model_hint(),
                                     )
                                     if not base_model:
                                         continue
-                                    merged_model = model.get_merged_model(base_model=base_model)
-                                else:
-                                    merged_model = model.get_merged_model()
+                                    settings.exl3_base_model = base_model
+                                merged_model = model.get_merged_model()
                                 merged_model.save_pretrained(
                                     save_directory,
                                     max_shard_size=settings.max_shard_size,
@@ -941,13 +940,12 @@ def run():
                                 if settings.quantization == QuantizationMethod.EXL3:
                                     base_model = prompt_text(
                                         "Base HF model to merge into:",
-                                        default=model.get_base_model_hint(),
+                                        default=settings.exl3_base_model or model.get_base_model_hint(),
                                     )
                                     if not base_model:
                                         continue
-                                    merged_model = model.get_merged_model(base_model=base_model)
-                                else:
-                                    merged_model = model.get_merged_model()
+                                    settings.exl3_base_model = base_model
+                                merged_model = model.get_merged_model()
                                 merged_model.push_to_hub(
                                     repo_id,
                                     private=private,
