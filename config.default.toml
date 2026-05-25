@@ -103,9 +103,12 @@ kl_divergence_target = 0.01
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true
 
-# Whether to invert the final intervention direction during export (save/upload) so
-# refusal directions are amplified instead of suppressed (same intervention magnitude, opposite sign).
-invert = false
+# Inversion mode for the intervention direction.
+# "none" (default): no inversion, standard abliteration (suppress trait).
+# "a": optimize for suppression, invert direction at export time only.
+# "b": invert direction before optimization and flip scoring to maximize
+#       marker matches (full amplification mode).
+invert = "none"
 
 # How to apply row normalization of the weights. Options:
 # "none" (no normalization),

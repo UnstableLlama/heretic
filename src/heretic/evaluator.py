@@ -4,7 +4,7 @@
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import Settings
+from .config import InvertMode, Settings
 from .model import Model
 from .utils import Prompt, load_prompts, print
 
@@ -110,9 +110,17 @@ class Evaluator:
         kl_divergence_scale = self.settings.kl_divergence_scale
         kl_divergence_target = self.settings.kl_divergence_target
 
-        refusals_score = (
-            refusals / self.base_refusals if self.base_refusals > 0 else float(refusals)
-        )
+        if self.settings.invert == InvertMode.B:
+            n_prompts = len(self.bad_prompts)
+            refusals_score = (
+                (n_prompts - refusals) / n_prompts if n_prompts > 0 else 0.0
+            )
+        else:
+            refusals_score = (
+                refusals / self.base_refusals
+                if self.base_refusals > 0
+                else float(refusals)
+            )
 
         if kl_divergence >= kl_divergence_target:
             kld_score = kl_divergence / kl_divergence_scale
