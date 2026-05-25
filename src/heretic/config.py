@@ -26,6 +26,12 @@ class QuantizationMethod(str, Enum):
     EXL3 = "exl3"
 
 
+class InvertMode(str, Enum):
+    NONE = "none"
+    A = "a"
+    B = "b"
+
+
 class RowNormalization(str, Enum):
     NONE = "none"
     PRE = "pre"
@@ -309,12 +315,26 @@ class Settings(BaseSettings):
     )
 
 
-    invert: bool = Field(
-        default=False,
+    invert: InvertMode = Field(
+        default=InvertMode.NONE,
         description=(
-            "Whether to invert the final intervention direction during export (save/upload) so refusal directions are "
-            "amplified instead of suppressed (same intervention magnitude, opposite sign)."
+            "Inversion mode for the intervention direction. "
+            '"none" (default): no inversion. '
+            '"a": optimize for suppression, invert at export time only. '
+            '"b": invert direction before optimization and flip scoring to search '
+            "for more marker matches (full amplification)."
         ),
+    )
+
+    markers: str | None = Field(
+        default=None,
+        description=(
+            "Path to a JSONL file of response markers, or the name of a built-in marker set "
+            '(e.g. "loving"). Each line of the JSONL file should be a JSON object with a '
+            '"marker" key. When set, these markers replace the default refusal_markers for '
+            "trait detection during evaluation."
+        ),
+        exclude=True,
     )
 
     row_normalization: RowNormalization = Field(

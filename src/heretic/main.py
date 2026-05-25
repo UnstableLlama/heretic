@@ -62,7 +62,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod
+from .config import InvertMode, QuantizationMethod
 from .evaluator import Evaluator
 from .exl3_model import Exl3Model
 from .model import AbliterationParameters, Model, get_model_class
@@ -73,6 +73,7 @@ from .utils import (
     get_readme_intro,
     get_trial_parameters,
     is_hf_path,
+    load_markers,
     load_prompts,
     print,
     print_memory_usage,
@@ -340,6 +341,13 @@ def run():
         settings.good_evaluation_prompts.dataset = neutral_dataset
         settings.bad_evaluation_prompts.dataset = positive_dataset
 
+    if settings.markers is not None:
+        print()
+        print(f"Loading markers from [bold]{settings.markers}[/]...")
+        custom_markers = load_markers(settings.markers)
+        settings.refusal_markers = custom_markers
+        print(f"* [bold]{len(custom_markers)}[/] markers loaded (replacing default refusal markers)")
+
     if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)
     else:
@@ -497,7 +505,7 @@ def run():
         refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
         del good_directions, projection_vector
 
-    if settings.invert:
+    if settings.invert == InvertMode.B:
         refusal_directions = -refusal_directions
 
     del good_means, bad_means
@@ -672,10 +680,11 @@ def run():
         # Get the Pareto front of trials. We can't use study.best_trials directly
         # as get_score() doesn't return the pure KL divergence and refusal count.
         # Note: Unlike study.best_trials, this does not handle objective constraints.
+        refusal_sort_sign = -1 if settings.invert == InvertMode.B else 1
         sorted_trials = sorted(
             completed_trials,
             key=lambda trial: (
-                trial.user_attrs["refusals"],
+                refusal_sort_sign * trial.user_attrs["refusals"],
                 trial.user_attrs["kl_divergence"],
             ),
         )
@@ -815,7 +824,7 @@ def run():
                 try:
                     match action:
                         case "Save the model to a local folder":
-                            if settings.invert:
+                            if settings.invert == InvertMode.A:
                                 print("* Applying inverted intervention for export...")
                                 reset_trial_model(invert=True)
                             save_directory = prompt_path("Path to the folder:")
@@ -888,11 +897,11 @@ def run():
                                 reset_trial_model()
 
                             print(f"Model saved to [bold]{merge_output_directory}[/].")
-                            if settings.invert:
+                            if settings.invert == InvertMode.A:
                                 reset_trial_model()
 
                         case "Upload the model to Hugging Face":
-                            if settings.invert:
+                            if settings.invert == InvertMode.A:
                                 print("* Applying inverted intervention for export...")
                                 reset_trial_model(invert=True)
                             # We don't use huggingface_hub.login() because that stores the token on disk,
@@ -1073,7 +1082,7 @@ def run():
                                 )
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
-                            if settings.invert:
+                            if settings.invert == InvertMode.A:
                                 reset_trial_model()
 
                         case "Chat with the model":
