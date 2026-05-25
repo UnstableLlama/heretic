@@ -478,6 +478,7 @@ class Exl3Model:
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
+        sign: float = 1.0,
     ) -> None:
         if self.settings.row_normalization != RowNormalization.NONE:
             # Row normalization paths require either reading and overwriting
@@ -522,6 +523,7 @@ class Exl3Model:
                 kernel_weight = params.max_weight + (
                     distance / params.min_weight_distance
                 ) * (params.min_weight - params.max_weight)
+                kernel_weight *= sign
 
                 if refusal_direction is None:
                     layer_refusal_direction = refusal_directions[layer_index + 1]
