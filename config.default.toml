@@ -103,8 +103,8 @@ kl_divergence_target = 0.01
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true
 
-# Whether to invert the final intervention direction so that refusal directions
-# are amplified instead of suppressed (same intervention magnitude, opposite sign).
+# Whether to invert the final intervention direction during export (save/upload) so
+# refusal directions are amplified instead of suppressed (same intervention magnitude, opposite sign).
 invert = false
 
 # How to apply row normalization of the weights. Options:

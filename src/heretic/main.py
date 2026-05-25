@@ -777,12 +777,13 @@ def run():
 
             # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893 once a LoRA is merged it's
             # expected to be empty. Provide a utility function to restore the previous LoRA-ified state.
-            def reset_trial_model() -> None:
+            def reset_trial_model(*, invert: bool = False) -> None:
                 print("* Resetting model...")
                 model.reset_model()
                 print("* Abliterating...")
+                directions = -refusal_directions if invert else refusal_directions
                 model.abliterate(
-                    refusal_directions,
+                    directions,
                     trial.user_attrs["direction_index"],
                     {
                         k: AbliterationParameters(**v)
@@ -814,6 +815,9 @@ def run():
                 try:
                     match action:
                         case "Save the model to a local folder":
+                            if settings.invert:
+                                print("* Applying inverted intervention for export...")
+                                reset_trial_model(invert=True)
                             save_directory = prompt_path("Path to the folder:")
                             if not save_directory:
                                 continue
@@ -884,8 +888,13 @@ def run():
                                 reset_trial_model()
 
                             print(f"Model saved to [bold]{merge_output_directory}[/].")
+                            if settings.invert:
+                                reset_trial_model()
 
                         case "Upload the model to Hugging Face":
+                            if settings.invert:
+                                print("* Applying inverted intervention for export...")
+                                reset_trial_model(invert=True)
                             # We don't use huggingface_hub.login() because that stores the token on disk,
                             # and since this program will often be run on rented or shared GPU servers,
                             # it's better to not persist credentials.
@@ -1064,6 +1073,8 @@ def run():
                                 )
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
+                            if settings.invert:
+                                reset_trial_model()
 
                         case "Chat with the model":
                             print()

@@ -312,7 +312,7 @@ class Settings(BaseSettings):
     invert: bool = Field(
         default=False,
         description=(
-            "Whether to invert the final intervention direction so that refusal directions are "
+            "Whether to invert the final intervention direction during export (save/upload) so refusal directions are "
             "amplified instead of suppressed (same intervention magnitude, opposite sign)."
         ),
     )
