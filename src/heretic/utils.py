@@ -202,6 +202,8 @@ def load_prompts(
             split=split_str,
         )
     else:
+        local_path = Path(path)
+
         if Path(path, DATASET_STATE_JSON_FILENAME).exists():
             # Dataset saved with datasets.save_to_disk; needs special handling.
             # Path should be the subdirectory for a particular split.
@@ -218,6 +220,22 @@ def load_prompts(
             abs_instruction = instruction.to_absolute(name2len)[0]
             # Get the dataset by applying the indices.
             dataset = dataset[abs_instruction.from_ : abs_instruction.to]
+        elif local_path.is_file() and local_path.suffix.lower() in {".jsonl", ".json"}:
+            dataset = load_dataset(
+                "json",
+                data_files={"train": str(local_path)},
+                split=split_str,
+                verification_mode=VerificationMode.NO_CHECKS,
+                download_mode=DownloadMode.FORCE_REDOWNLOAD,
+            )
+        elif local_path.is_file() and local_path.suffix.lower() == ".parquet":
+            dataset = load_dataset(
+                "parquet",
+                data_files={"train": str(local_path)},
+                split=split_str,
+                verification_mode=VerificationMode.NO_CHECKS,
+                download_mode=DownloadMode.FORCE_REDOWNLOAD,
+            )
         else:
             # Path should be a local directory.
             dataset = load_dataset(

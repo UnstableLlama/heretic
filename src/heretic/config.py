@@ -308,6 +308,15 @@ class Settings(BaseSettings):
         ),
     )
 
+
+    invert: bool = Field(
+        default=False,
+        description=(
+            "Whether to invert the final intervention direction during export (save/upload) so refusal directions are "
+            "amplified instead of suppressed (same intervention magnitude, opposite sign)."
+        ),
+    )
+
     row_normalization: RowNormalization = Field(
         default=RowNormalization.FULL,
         description=(
@@ -471,6 +480,16 @@ class Settings(BaseSettings):
     system_prompt: str = Field(
         default="You are a helpful assistant.",
         description="System prompt to use when prompting the model.",
+    )
+
+    datasets: bool = Field(
+        default=False,
+        description=(
+            "Prompt interactively for dataset IDs to use as the neutral and positive prompt datasets. "
+            "If enabled, these dataset IDs override good/bad prompt datasets (and their evaluation counterparts) "
+            "for this run."
+        ),
+        exclude=True,
     )
 
     good_prompts: DatasetSpecification = Field(
