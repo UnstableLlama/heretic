@@ -73,6 +73,7 @@ from .utils import (
     get_readme_intro,
     get_trial_parameters,
     is_hf_path,
+    load_markers,
     load_prompts,
     print,
     print_memory_usage,
@@ -339,6 +340,13 @@ def run():
         settings.bad_prompts.dataset = positive_dataset
         settings.good_evaluation_prompts.dataset = neutral_dataset
         settings.bad_evaluation_prompts.dataset = positive_dataset
+
+    if settings.markers is not None:
+        print()
+        print(f"Loading markers from [bold]{settings.markers}[/]...")
+        custom_markers = load_markers(settings.markers)
+        settings.refusal_markers = custom_markers
+        print(f"* [bold]{len(custom_markers)}[/] markers loaded (replacing default refusal markers)")
 
     if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)

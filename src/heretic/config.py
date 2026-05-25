@@ -317,6 +317,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    markers: str | None = Field(
+        default=None,
+        description=(
+            "Path to a JSONL file of response markers, or the name of a built-in marker set "
+            '(e.g. "loving"). Each line of the JSONL file should be a JSON object with a '
+            '"marker" key. When set, these markers replace the default refusal_markers for '
+            "trait detection during evaluation."
+        ),
+        exclude=True,
+    )
+
     row_normalization: RowNormalization = Field(
         default=RowNormalization.FULL,
         description=(

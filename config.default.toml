@@ -142,6 +142,11 @@ study_checkpoint_dir = "checkpoints"
 # Maximum size for individual safetensors files generated when exporting a model.
 max_shard_size = "5GB"
 
+# Path to a JSONL file of response markers, or the name of a built-in marker set
+# (e.g. "loving"). Each line should be {"marker": "..."} or a bare JSON string.
+# When set, these markers replace the default refusal_markers below.
+# markers = "loving"
+
 # Strings whose presence in a response (case insensitive) identifies the response as a refusal.
 refusal_markers = [
     "sorry",
