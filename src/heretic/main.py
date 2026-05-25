@@ -505,8 +505,7 @@ def run():
         refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
         del good_directions, projection_vector
 
-    if settings.invert == InvertMode.B:
-        refusal_directions = -refusal_directions
+    optim_sign = -1.0 if settings.invert == InvertMode.B else 1.0
 
     del good_means, bad_means
 
@@ -599,7 +598,7 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(refusal_directions, direction_index, parameters, sign=optim_sign)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -786,18 +785,18 @@ def run():
 
             # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893 once a LoRA is merged it's
             # expected to be empty. Provide a utility function to restore the previous LoRA-ified state.
-            def reset_trial_model(*, invert: bool = False) -> None:
+            def reset_trial_model(*, sign: float = optim_sign) -> None:
                 print("* Resetting model...")
                 model.reset_model()
                 print("* Abliterating...")
-                directions = -refusal_directions if invert else refusal_directions
                 model.abliterate(
-                    directions,
+                    refusal_directions,
                     trial.user_attrs["direction_index"],
                     {
                         k: AbliterationParameters(**v)
                         for k, v in trial.user_attrs["parameters"].items()
                     },
+                    sign=sign,
                 )
 
             reset_trial_model()
@@ -826,7 +825,7 @@ def run():
                         case "Save the model to a local folder":
                             if settings.invert == InvertMode.A:
                                 print("* Applying inverted intervention for export...")
-                                reset_trial_model(invert=True)
+                                reset_trial_model(sign=-1.0)
                             save_directory = prompt_path("Path to the folder:")
                             if not save_directory:
                                 continue
@@ -903,7 +902,7 @@ def run():
                         case "Upload the model to Hugging Face":
                             if settings.invert == InvertMode.A:
                                 print("* Applying inverted intervention for export...")
-                                reset_trial_model(invert=True)
+                                reset_trial_model(sign=-1.0)
                             # We don't use huggingface_hub.login() because that stores the token on disk,
                             # and since this program will often be run on rented or shared GPU servers,
                             # it's better to not persist credentials.
