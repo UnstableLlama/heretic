@@ -322,6 +322,24 @@ def run():
         elif choice is None or choice == "":
             return
 
+    if settings.datasets:
+        print()
+        neutral_dataset = prompt_text(
+            "Neutral prompt dataset:",
+            default=settings.good_prompts.dataset,
+            unsafe=True,
+        )
+        positive_dataset = prompt_text(
+            "Positive prompt dataset:",
+            default=settings.bad_prompts.dataset,
+            unsafe=True,
+        )
+
+        settings.good_prompts.dataset = neutral_dataset
+        settings.bad_prompts.dataset = positive_dataset
+        settings.good_evaluation_prompts.dataset = neutral_dataset
+        settings.bad_evaluation_prompts.dataset = positive_dataset
+
     if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)
     else:
