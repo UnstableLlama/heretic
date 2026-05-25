@@ -103,6 +103,10 @@ kl_divergence_target = 0.01
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true
 
+# Whether to invert the final intervention direction so that refusal directions
+# are amplified instead of suppressed (same intervention magnitude, opposite sign).
+invert = false
+
 # How to apply row normalization of the weights. Options:
 # "none" (no normalization),
 # "pre" (compute LoRA adapter relative to row-normalized weights),
@@ -176,6 +180,10 @@ refusal_markers = [
 
 # System prompt to use when prompting the model.
 system_prompt = "You are a helpful assistant."
+
+# Prompt interactively for dataset IDs to use as neutral/positive prompt datasets.
+# If enabled, these dataset IDs override good/bad prompt datasets (and their evaluation counterparts) for this run.
+# datasets = false
 
 # Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).
 [good_prompts]
