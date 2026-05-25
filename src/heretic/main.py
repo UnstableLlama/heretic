@@ -497,6 +497,9 @@ def run():
         refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
         del good_directions, projection_vector
 
+    if settings.invert:
+        refusal_directions = -refusal_directions
+
     del good_means, bad_means
 
     # Clear cache before starting the optimization study.
