@@ -473,6 +473,16 @@ class Settings(BaseSettings):
         description="System prompt to use when prompting the model.",
     )
 
+    datasets: bool = Field(
+        default=False,
+        description=(
+            "Prompt interactively for dataset IDs to use as the neutral and positive prompt datasets. "
+            "If enabled, these dataset IDs override good/bad prompt datasets (and their evaluation counterparts) "
+            "for this run."
+        ),
+        exclude=True,
+    )
+
     good_prompts: DatasetSpecification = Field(
         default=DatasetSpecification(
             dataset="mlabonne/harmless_alpaca",
