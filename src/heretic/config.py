@@ -308,6 +308,15 @@ class Settings(BaseSettings):
         ),
     )
 
+
+    invert: bool = Field(
+        default=False,
+        description=(
+            "Whether to invert the final intervention direction so that refusal directions are "
+            "amplified instead of suppressed (same intervention magnitude, opposite sign)."
+        ),
+    )
+
     row_normalization: RowNormalization = Field(
         default=RowNormalization.FULL,
         description=(
