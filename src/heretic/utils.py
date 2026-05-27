@@ -202,8 +202,6 @@ def load_prompts(
             split=split_str,
         )
     else:
-        local_path = Path(path)
-
         if Path(path, DATASET_STATE_JSON_FILENAME).exists():
             # Dataset saved with datasets.save_to_disk; needs special handling.
             # Path should be the subdirectory for a particular split.
@@ -220,22 +218,6 @@ def load_prompts(
             abs_instruction = instruction.to_absolute(name2len)[0]
             # Get the dataset by applying the indices.
             dataset = dataset[abs_instruction.from_ : abs_instruction.to]
-        elif local_path.is_file() and local_path.suffix.lower() in {".jsonl", ".json"}:
-            dataset = load_dataset(
-                "json",
-                data_files={"train": str(local_path)},
-                split=split_str,
-                verification_mode=VerificationMode.NO_CHECKS,
-                download_mode=DownloadMode.FORCE_REDOWNLOAD,
-            )
-        elif local_path.is_file() and local_path.suffix.lower() == ".parquet":
-            dataset = load_dataset(
-                "parquet",
-                data_files={"train": str(local_path)},
-                split=split_str,
-                verification_mode=VerificationMode.NO_CHECKS,
-                download_mode=DownloadMode.FORCE_REDOWNLOAD,
-            )
         else:
             # Path should be a local directory.
             dataset = load_dataset(
@@ -268,49 +250,6 @@ def load_prompts(
         )
         for prompt in prompts
     ]
-
-
-def load_markers(path_or_name: str) -> list[str]:
-    """Load response markers from a JSONL file or a built-in marker set name.
-
-    Resolution order:
-      1. If ``path_or_name`` is an existing file path, load it directly.
-      2. Otherwise, look for a built-in marker set at
-         ``<package>/markers/<name>.jsonl``.
-    """
-    candidate = Path(path_or_name)
-    if not candidate.is_file():
-        builtin = Path(__file__).parent / "markers" / f"{path_or_name}.jsonl"
-        if builtin.is_file():
-            candidate = builtin
-        else:
-            raise FileNotFoundError(
-                f"Marker set '{path_or_name}' not found as a file or built-in. "
-                f"Built-in marker sets live in {Path(__file__).parent / 'markers'}."
-            )
-
-    markers: list[str] = []
-    with open(candidate, encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid JSON on line {line_no} of {candidate}: {e}"
-                ) from e
-            if isinstance(obj, str):
-                markers.append(obj)
-            elif isinstance(obj, dict) and "marker" in obj:
-                markers.append(obj["marker"])
-            else:
-                raise ValueError(
-                    f"Line {line_no} of {candidate}: expected a string or "
-                    f'{{"marker": "..."}}, got {obj!r}'
-                )
-    return markers
 
 
 T = TypeVar("T")

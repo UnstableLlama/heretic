@@ -62,7 +62,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import InvertMode, QuantizationMethod
+from .config import QuantizationMethod
 from .evaluator import Evaluator
 from .exl3_model import Exl3Model
 from .model import AbliterationParameters, Model, get_model_class
@@ -73,7 +73,6 @@ from .utils import (
     get_readme_intro,
     get_trial_parameters,
     is_hf_path,
-    load_markers,
     load_prompts,
     print,
     print_memory_usage,
@@ -323,31 +322,6 @@ def run():
         elif choice is None or choice == "":
             return
 
-    if settings.datasets:
-        print()
-        neutral_dataset = prompt_text(
-            "Neutral prompt dataset:",
-            default=settings.good_prompts.dataset,
-            unsafe=True,
-        )
-        positive_dataset = prompt_text(
-            "Positive prompt dataset:",
-            default=settings.bad_prompts.dataset,
-            unsafe=True,
-        )
-
-        settings.good_prompts.dataset = neutral_dataset
-        settings.bad_prompts.dataset = positive_dataset
-        settings.good_evaluation_prompts.dataset = neutral_dataset
-        settings.bad_evaluation_prompts.dataset = positive_dataset
-
-    if settings.markers is not None:
-        print()
-        print(f"Loading markers from [bold]{settings.markers}[/]...")
-        custom_markers = load_markers(settings.markers)
-        settings.refusal_markers = custom_markers
-        print(f"* [bold]{len(custom_markers)}[/] markers loaded (replacing default refusal markers)")
-
     if settings.quantization == QuantizationMethod.EXL3:
         model = Exl3Model(settings)
     else:
@@ -505,8 +479,6 @@ def run():
         refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
         del good_directions, projection_vector
 
-    optim_sign = -1.0 if settings.invert == InvertMode.B else 1.0
-
     del good_means, bad_means
 
     # Clear cache before starting the optimization study.
@@ -598,7 +570,7 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters, sign=optim_sign)
+        model.abliterate(refusal_directions, direction_index, parameters)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -679,11 +651,10 @@ def run():
         # Get the Pareto front of trials. We can't use study.best_trials directly
         # as get_score() doesn't return the pure KL divergence and refusal count.
         # Note: Unlike study.best_trials, this does not handle objective constraints.
-        refusal_sort_sign = -1 if settings.invert == InvertMode.B else 1
         sorted_trials = sorted(
             completed_trials,
             key=lambda trial: (
-                refusal_sort_sign * trial.user_attrs["refusals"],
+                trial.user_attrs["refusals"],
                 trial.user_attrs["kl_divergence"],
             ),
         )
@@ -785,7 +756,7 @@ def run():
 
             # Per https://github.com/huggingface/peft/issues/868#issuecomment-1820642893 once a LoRA is merged it's
             # expected to be empty. Provide a utility function to restore the previous LoRA-ified state.
-            def reset_trial_model(*, sign: float = optim_sign) -> None:
+            def reset_trial_model() -> None:
                 print("* Resetting model...")
                 model.reset_model()
                 print("* Abliterating...")
@@ -796,7 +767,6 @@ def run():
                         k: AbliterationParameters(**v)
                         for k, v in trial.user_attrs["parameters"].items()
                     },
-                    sign=sign,
                 )
 
             reset_trial_model()
@@ -823,9 +793,6 @@ def run():
                 try:
                     match action:
                         case "Save the model to a local folder":
-                            if settings.invert == InvertMode.A:
-                                print("* Applying inverted intervention for export...")
-                                reset_trial_model(sign=-1.0)
                             save_directory = prompt_path("Path to the folder:")
                             if not save_directory:
                                 continue
@@ -896,13 +863,8 @@ def run():
                                 reset_trial_model()
 
                             print(f"Model saved to [bold]{merge_output_directory}[/].")
-                            if settings.invert == InvertMode.A:
-                                reset_trial_model()
 
                         case "Upload the model to Hugging Face":
-                            if settings.invert == InvertMode.A:
-                                print("* Applying inverted intervention for export...")
-                                reset_trial_model(sign=-1.0)
                             # We don't use huggingface_hub.login() because that stores the token on disk,
                             # and since this program will often be run on rented or shared GPU servers,
                             # it's better to not persist credentials.
@@ -1081,8 +1043,6 @@ def run():
                                 )
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
-                            if settings.invert == InvertMode.A:
-                                reset_trial_model()
 
                         case "Chat with the model":
                             print()

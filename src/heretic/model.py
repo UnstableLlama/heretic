@@ -452,7 +452,6 @@ class Model:
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
-        sign: float = 1.0,
     ):
         if direction_index is None:
             refusal_direction = None
@@ -488,7 +487,6 @@ class Model:
                 weight = params.max_weight + (distance / params.min_weight_distance) * (
                     params.min_weight - params.max_weight
                 )
-                weight *= sign
 
                 if refusal_direction is None:
                     # The index must be shifted by 1 because the first element
