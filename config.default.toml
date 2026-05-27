@@ -103,13 +103,6 @@ kl_divergence_target = 0.01
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true
 
-# Inversion mode for the intervention direction.
-# "none" (default): no inversion, standard abliteration (suppress trait).
-# "a": optimize for suppression, invert direction at export time only.
-# "b": invert direction before optimization and flip scoring to maximize
-#       marker matches (full amplification mode).
-invert = "none"
-
 # How to apply row normalization of the weights. Options:
 # "none" (no normalization),
 # "pre" (compute LoRA adapter relative to row-normalized weights),
@@ -144,11 +137,6 @@ study_checkpoint_dir = "checkpoints"
 
 # Maximum size for individual safetensors files generated when exporting a model.
 max_shard_size = "5GB"
-
-# Path to a JSONL file of response markers, or the name of a built-in marker set
-# (e.g. "loving"). Each line should be {"marker": "..."} or a bare JSON string.
-# When set, these markers replace the default refusal_markers below.
-# markers = "loving"
 
 # Strings whose presence in a response (case insensitive) identifies the response as a refusal.
 refusal_markers = [
@@ -188,10 +176,6 @@ refusal_markers = [
 
 # System prompt to use when prompting the model.
 system_prompt = "You are a helpful assistant."
-
-# Prompt interactively for dataset IDs to use as neutral/positive prompt datasets.
-# If enabled, these dataset IDs override good/bad prompt datasets (and their evaluation counterparts) for this run.
-# datasets = false
 
 # Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).
 [good_prompts]
