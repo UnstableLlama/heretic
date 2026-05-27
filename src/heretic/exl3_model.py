@@ -190,6 +190,7 @@ class Exl3Model:
 
         model_path = str(Path(settings.model).expanduser())
         self.config = self._exl_api["Config"].from_directory(model_path)
+        self._configure_multi_gpu_loading()
         self.model = self._exl_api["Model"].from_config(self.config)
 
         if inspect_only:
@@ -214,6 +215,7 @@ class Exl3Model:
                 self.model, max_num_tokens=max_num_tokens
             )
             self.model.load(progressbar=True)
+            self._report_loaded_devices()
 
             exl3_tok = self._exl_api["Tokenizer"].from_config(self.config)
             self.tokenizer = _Exl3Tokenizer(exl3_tok, model_path)
@@ -248,6 +250,68 @@ class Exl3Model:
     # ------------------------------------------------------------------
     # Loading helpers
     # ------------------------------------------------------------------
+
+    def _configure_multi_gpu_loading(self) -> None:
+        """Best-effort multi-GPU configuration for exllamav3.
+
+        exllamav3 has changed config field names across versions. We therefore
+        probe several known/likely attributes and set whichever exist.
+        """
+        if not torch.cuda.is_available():
+            return
+
+        gpu_count = torch.cuda.device_count()
+        if gpu_count <= 1:
+            return
+
+        print(f"* CUDA devices visible to Heretic: [bold]{gpu_count}[/]")
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
+        print("* CUDA device list: " + ", ".join(f"[{i}] {name}" for i, name in enumerate(gpu_names)))
+
+        touched: list[str] = []
+        candidates: list[tuple[str, Any]] = [
+            ("gpu_split", [1.0] * gpu_count),
+            ("gpu_split_auto", True),
+            ("auto_gpu_split", True),
+            ("auto_split", True),
+            ("tp", gpu_count),
+            ("tensor_parallel", gpu_count),
+            ("num_gpus", gpu_count),
+        ]
+
+        for attr, value in candidates:
+            if hasattr(self.config, attr):
+                setattr(self.config, attr, value)
+                touched.append(attr)
+
+        if touched:
+            print(
+                "* EXL3 multi-GPU hints applied: "
+                + ", ".join(f"[bold]{name}[/]" for name in touched)
+            )
+        else:
+            print(
+                "[yellow]* WARNING:[/] EXL3 config exposes no known multi-GPU knobs; "
+                "continuing with exllamav3 defaults."
+            )
+
+    def _report_loaded_devices(self) -> None:
+        """Log where exllamav3 actually placed modules after load."""
+        device_counts: dict[str, int] = {}
+        for module in self.model:
+            device = getattr(module, "device", None)
+            if device is None:
+                continue
+            key = str(device)
+            device_counts[key] = device_counts.get(key, 0) + 1
+
+        if not device_counts:
+            return
+
+        device_summary = ", ".join(
+            f"{device}: {count}" for device, count in sorted(device_counts.items())
+        )
+        print(f"* EXL3 module placement: {device_summary}")
 
     @staticmethod
     def _import_exllamav3() -> ModuleType:
