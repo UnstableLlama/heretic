@@ -300,6 +300,31 @@ class Settings(BaseSettings):
         ),
     )
 
+    use_ara: bool = Field(
+        default=False,
+        description=(
+            "Whether to use Arbitrary-Rank Ablation (ARA), an abliteration method based on matrix optimization, "
+            "instead of traditional directional ablation."
+        ),
+    )
+
+    use_ara_lora: bool = Field(
+        default=False,
+        description=(
+            "Use LoRA in ARA instead of full-weight editing. "
+            "Makes ARA compatible with quantization and removes model reloads between trials. "
+            "Based on work by kabachuha (https://github.com/p-e-w/heretic/pull/332)."
+        ),
+    )
+
+    ara_lora_rank: int = Field(
+        default=128,
+        description=(
+            "If LoRA is used in ARA, this sets its rank. "
+            "Keep it high enough to simulate the 'arbitrary' effect."
+        ),
+    )
+
     orthogonalize_direction: bool = Field(
         default=True,
         description=(

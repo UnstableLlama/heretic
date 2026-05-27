@@ -5,7 +5,7 @@ import math
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Type, cast
+from typing import Any, Callable, Type, TypeAlias, cast
 
 import bitsandbytes as bnb
 import torch
@@ -15,6 +15,8 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
+from torch.optim import LBFGS
+from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -32,7 +34,7 @@ from transformers.generation import (
 
 from .config import QuantizationMethod, RowNormalization, Settings
 from .system import empty_cache
-from .utils import Prompt, batchify, print
+from .utils import Prompt, batchify, mean_distances_to_knn, print
 
 
 def get_model_class(
@@ -54,6 +56,21 @@ class AbliterationParameters:
     min_weight_distance: float
 
 
+@dataclass
+class ARAParameters:
+    start_layer_index: int
+    end_layer_index: int
+    preserve_good_behavior_weight: float
+    steer_bad_behavior_weight: float
+    overcorrect_relative_weight: float
+    neighbor_count: int
+
+
+# The list contains one element per layer.
+# Each element maps from the component name to a (possibly sparse) mapping
+# from the module index to an (input, output) tuple containing the I/O
+# tensors of shape (prompt, component).
+ModuleIO: TypeAlias = list[dict[str, dict[int, tuple[Tensor, Tensor]]]]
 
 
 @contextmanager
@@ -179,7 +196,8 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        self._apply_lora()
+        if not settings.use_ara or settings.use_ara_lora:
+            self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
@@ -222,7 +240,9 @@ class Model:
 
         target_modules = sorted(target_modules_set)
 
-        if self.settings.row_normalization != RowNormalization.FULL:
+        if self.settings.use_ara_lora:
+            lora_rank = self.settings.ara_lora_rank
+        elif self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
             lora_rank = 1
         else:
@@ -333,7 +353,11 @@ class Model:
           performs full model reload with quantization config.
         """
         current_model = getattr(self.model.config, "name_or_path", None)
-        if current_model == self.settings.model and not self.needs_reload:
+        if (
+            current_model == self.settings.model
+            and not self.needs_reload
+            and (not self.settings.use_ara or self.settings.use_ara_lora)
+        ):
             # Reset LoRA adapters to zero (identity transformation)
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
@@ -364,7 +388,8 @@ class Model:
                 **extra_kwargs,
             )
 
-        self._apply_lora()
+        if not self.settings.use_ara or self.settings.use_ara_lora:
+            self._apply_lora()
 
         self.needs_reload = False
 
@@ -589,6 +614,278 @@ class Model:
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+    def ara_abliterate(
+        self,
+        good_module_io: ModuleIO,
+        bad_module_io: ModuleIO,
+        parameters: ARAParameters,
+    ):
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    module = cast(Linear, module)
+                    matrix = module.weight
+
+                    row_norms = LA.vector_norm(matrix, dim=1, keepdim=True).detach()
+
+                    def get_matrix() -> Tensor:
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            return row_norms * F.normalize(matrix, p=2, dim=1)
+                        else:
+                            return matrix
+
+                    good_input, good_output = good_module_io[layer_index][component][
+                        module_index
+                    ]
+                    bad_input, bad_output = bad_module_io[layer_index][component][
+                        module_index
+                    ]
+
+                    good_input = good_input.to(matrix.device)
+                    good_output = good_output.to(matrix.device)
+                    bad_input = bad_input.to(matrix.device)
+                    bad_output = bad_output.to(matrix.device)
+
+                    def objective(matrix: Tensor) -> Tensor:
+                        new_good_output = good_input @ matrix.T
+                        new_bad_output = bad_input @ matrix.T
+
+                        preserve_good_behavior = (
+                            (new_good_output - good_output) ** 2
+                        ).mean()
+
+                        steer_bad_behavior = (
+                            mean_distances_to_knn(
+                                new_bad_output,
+                                good_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                            + parameters.overcorrect_relative_weight
+                            * -mean_distances_to_knn(
+                                new_bad_output,
+                                bad_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                        )
+
+                        return (
+                            parameters.preserve_good_behavior_weight
+                            * preserve_good_behavior
+                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
+                        )
+
+                    optimizer = LBFGS(
+                        [matrix],
+                        lr=1.0,
+                        max_iter=20,
+                        history_size=10,
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def closure() -> Tensor:
+                        optimizer.zero_grad()
+                        loss = objective(get_matrix())
+                        loss.backward()
+                        return loss
+
+                    for step in range(5):
+                        optimizer.step(closure)
+
+                    with torch.no_grad():
+                        matrix.copy_(get_matrix())
+
+    def ara_lora_abliterate(
+        self,
+        good_module_io: ModuleIO,
+        bad_module_io: ModuleIO,
+        parameters: ARAParameters,
+    ):
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    module = cast(Linear, module)
+
+                    base_weight = cast(Tensor, module.base_layer.weight)
+                    quant_state = getattr(base_weight, "quant_state", None)
+
+                    if quant_state is None:
+                        W_base = base_weight.to(torch.float32)
+                    else:
+                        W_base = cast(
+                            Tensor,
+                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                                base_weight.data,
+                                quant_state,
+                            ).to(torch.float32),
+                        )
+
+                    W_row_norms = LA.vector_norm(W_base, dim=1, keepdim=True).detach()
+
+                    lora_A = cast(Tensor, module.lora_A["default"].weight)
+                    lora_B = cast(Tensor, module.lora_B["default"].weight)
+
+                    good_input, good_output = good_module_io[layer_index][component][module_index]
+                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
+
+                    good_input = good_input.float().to(lora_A.device)
+                    good_output = good_output.float().to(lora_A.device)
+                    bad_input = bad_input.float().to(lora_A.device)
+                    bad_output = bad_output.float().to(lora_A.device)
+
+                    def objective(A: Tensor, B: Tensor) -> Tensor:
+                        W_eff = W_base + (B @ A)
+
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
+
+                        new_good_output = good_input @ W_eff.T
+                        new_bad_output = bad_input @ W_eff.T
+
+                        preserve_good_behavior = (
+                            (new_good_output - good_output) ** 2
+                        ).mean()
+
+                        steer_bad_behavior = (
+                            mean_distances_to_knn(
+                                new_bad_output,
+                                good_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                            + parameters.overcorrect_relative_weight
+                            * -mean_distances_to_knn(
+                                new_bad_output,
+                                bad_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                        )
+
+                        return (
+                            parameters.preserve_good_behavior_weight
+                            * preserve_good_behavior
+                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
+                        )
+
+                    optimizer = LBFGS(
+                        [lora_A, lora_B],
+                        lr=1.0,
+                        max_iter=20,
+                        history_size=10,
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def closure():
+                        optimizer.zero_grad()
+                        loss = objective(lora_A, lora_B)
+                        loss.backward()
+                        return loss
+
+                    for step in range(5):
+                        optimizer.step(closure)
+
+    def get_module_io(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        module_io: ModuleIO = []
+
+        def get_hook(
+            layer_index: int,
+            component: str,
+            module_index: int,
+        ) -> Callable[[Module, tuple[Tensor, ...], Tensor], None]:
+            def hook(
+                module: Module,
+                inputs: tuple[Tensor, ...],
+                outputs: Tensor,
+            ) -> None:
+                if len(module_io) == layer_index:
+                    module_io.append({})
+
+                assert len(module_io) == layer_index + 1
+
+                if component not in module_io[layer_index]:
+                    module_io[layer_index][component] = {}
+
+                assert module_index not in module_io[layer_index][component]
+
+                input = inputs[0][:, -1, :].detach().clone().cpu()
+                output = outputs[:, -1, :].detach().clone().cpu()
+
+                module_io[layer_index][component][module_index] = (input, output)
+
+            return hook
+
+        hook_handles: list[RemovableHandle] = []
+
+        for layer_index in range(len(self.get_layers())):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    hook_handles.append(
+                        module.register_forward_hook(
+                            get_hook(layer_index, component, module_index)
+                        )
+                    )
+
+        self.generate(prompts, max_new_tokens=1)
+
+        for hook_handle in hook_handles:
+            hook_handle.remove()
+
+        return module_io
+
+    def get_module_io_batched(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        module_io_batches: list[ModuleIO] = [
+            self.get_module_io(batch)
+            for batch in batchify(prompts, self.settings.batch_size)
+        ]
+
+        module_io: ModuleIO = []
+
+        for layer_index in range(len(self.get_layers())):
+            module_io.append({})
+
+            for module_io_batch in module_io_batches:
+                for component, io_map in module_io_batch[layer_index].items():
+                    if component not in module_io[layer_index]:
+                        module_io[layer_index][component] = {}
+
+                    for module_index in io_map:
+                        if module_index not in module_io[layer_index][component]:
+                            module_io[layer_index][component][module_index] = (
+                                torch.empty(0),
+                                torch.empty(0),
+                            )
+
+            for component, io_map in module_io[layer_index].items():
+                for module_index in io_map:
+                    inputs_outputs = [
+                        module_io_batch[layer_index][component][module_index]
+                        for module_io_batch in module_io_batches
+                        if component in module_io_batch[layer_index]
+                        and module_index in module_io_batch[layer_index][component]
+                    ]
+                    input = torch.cat(
+                        [input_output[0] for input_output in inputs_outputs],
+                        dim=0,
+                    )
+                    output = torch.cat(
+                        [input_output[1] for input_output in inputs_outputs],
+                        dim=0,
+                    )
+
+                    module_io[layer_index][component][module_index] = (input, output)
+
+        return module_io
 
     def generate(
         self,
