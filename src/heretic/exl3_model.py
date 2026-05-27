@@ -45,18 +45,20 @@ import math
 import re
 import shutil
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
 import torch
+import torch.linalg as LA
 import torch.nn.functional as F
 from torch import Tensor
+from torch.optim import LBFGS
 
 from .config import RowNormalization, Settings
+from .model import ARAParameters, AbliterationParameters, ModuleIO
 from .system import empty_cache
-from .utils import Prompt, batchify, print
+from .utils import Prompt, batchify, mean_distances_to_knn, print
 
 
 # Match keys like:
@@ -80,14 +82,6 @@ _MODULE_KEY_REGEX = re.compile(
 _BLOCK_KEY_REGEX = re.compile(
     r"^model(?:\.language_model)?\.layers\.(\d+)$"
 )
-
-
-@dataclass
-class AbliterationParameters:
-    max_weight: float
-    max_weight_position: float
-    min_weight: float
-    min_weight_distance: float
 
 
 class _Exl3Tokenizer:
@@ -436,15 +430,21 @@ class Exl3Model:
                     for module in modules:
                         self._allocate_lora_slot(module)
 
+    def _lora_rank(self) -> int:
+        if self.settings.use_ara_lora:
+            return self.settings.ara_lora_rank
+        return 1
+
     def _allocate_lora_slot(self, module: Any) -> None:
         device = module.device
+        rank = self._lora_rank()
         a = torch.zeros(
-            (module.in_features, 1),
+            (module.in_features, rank),
             dtype=torch.float16,
             device=device,
         )
         b = torch.zeros(
-            (1, module.out_features),
+            (rank, module.out_features),
             dtype=torch.float16,
             device=device,
         )
@@ -658,6 +658,217 @@ class Exl3Model:
                 for module in modules:
                     module.lora_a_tensors[self._lora_key].zero_()
                     module.lora_b_tensors[self._lora_key].zero_()
+
+    # ------------------------------------------------------------------
+    # ARA: module I/O capture + ARA LoRA optimisation
+    # ------------------------------------------------------------------
+
+    def _dequantize_weight(self, module: Any) -> Tensor:
+        """Dequantize a module's weight to fp32, returning (in_u, out_u)."""
+        in_u = module.in_features_unpadded
+        out_u = module.out_features_unpadded
+        if module.quant_type == "exl3":
+            W = module.inner.get_weight_tensor()
+        elif module.quant_type == "fp16":
+            W = module.inner.weight
+        else:
+            raise RuntimeError(
+                f"Unknown Linear.quant_type {module.quant_type!r} on {module.key}"
+            )
+        return W[:in_u, :out_u].to(torch.float32)
+
+    def get_module_io(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        module_io: ModuleIO = []
+
+        # Build a mapping from module id to (layer_index, component, module_index)
+        # and wrap each target module's forward to capture I/O.
+        originals: list[tuple[Any, Any]] = []  # (module, original_forward)
+
+        for layer_index in range(len(self._layer_modules)):
+            for component, modules in self._layer_modules[layer_index].items():
+                for module_index, module in enumerate(modules):
+                    orig = module.forward
+
+                    def _make_wrapper(
+                        orig_fn: Any,
+                        li: int,
+                        comp: str,
+                        mi: int,
+                    ) -> Any:
+                        def wrapped(x, params, out_dtype=None):
+                            out = orig_fn(x, params, out_dtype=out_dtype)
+                            while len(module_io) <= li:
+                                module_io.append({})
+                            if comp not in module_io[li]:
+                                module_io[li][comp] = {}
+                            # x shape: (B, T, in_features). Capture last position.
+                            inp = x[:, -1, :].detach().clone().cpu()
+                            outp = out[:, -1, :].detach().clone().cpu()
+                            module_io[li][comp][mi] = (inp, outp)
+                            return out
+
+                        return wrapped
+
+                    module.forward = _make_wrapper(orig, layer_index, component, module_index)
+                    originals.append((module, orig))
+
+        # Run a single forward pass to capture I/O.
+        input_ids = self._tokenize_chat(prompts)
+        with torch.inference_mode():
+            self.model.forward(input_ids, params={})
+
+        # Restore original forwards.
+        for module, orig in originals:
+            module.forward = orig
+
+        return module_io
+
+    def get_module_io_batched(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        module_io_batches: list[ModuleIO] = [
+            self.get_module_io(batch)
+            for batch in batchify(prompts, self.settings.batch_size)
+        ]
+
+        module_io: ModuleIO = []
+        for layer_index in range(len(self._layer_modules)):
+            module_io.append({})
+            for module_io_batch in module_io_batches:
+                if layer_index >= len(module_io_batch):
+                    continue
+                for component, io_map in module_io_batch[layer_index].items():
+                    if component not in module_io[layer_index]:
+                        module_io[layer_index][component] = {}
+                    for module_index in io_map:
+                        if module_index not in module_io[layer_index][component]:
+                            module_io[layer_index][component][module_index] = (
+                                torch.empty(0),
+                                torch.empty(0),
+                            )
+
+            for component, io_map in module_io[layer_index].items():
+                for module_index in io_map:
+                    inputs_outputs = [
+                        module_io_batch[layer_index][component][module_index]
+                        for module_io_batch in module_io_batches
+                        if layer_index < len(module_io_batch)
+                        and component in module_io_batch[layer_index]
+                        and module_index in module_io_batch[layer_index][component]
+                    ]
+                    inp = torch.cat([io[0] for io in inputs_outputs], dim=0)
+                    outp = torch.cat([io[1] for io in inputs_outputs], dim=0)
+                    module_io[layer_index][component][module_index] = (inp, outp)
+
+        return module_io
+
+    def ara_lora_abliterate(
+        self,
+        good_module_io: ModuleIO,
+        bad_module_io: ModuleIO,
+        parameters: ARAParameters,
+    ) -> None:
+        """ARA LoRA for EXL3: optimise the pre-allocated LoRA A/B tensors
+        using the same objective as standard ARA, but operating in the
+        EXL3 weight convention (input-major: (in, out)).
+        """
+        rank = self._lora_rank()
+
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            for component, modules in self._layer_modules[layer_index].items():
+                for module_index, module in enumerate(modules):
+                    in_u = module.in_features_unpadded
+                    out_u = module.out_features_unpadded
+                    device = module.device
+
+                    W_base = self._dequantize_weight(module).to(device)
+                    W_row_norms = LA.vector_norm(W_base, dim=0, keepdim=True).detach()
+
+                    # The optimisable LoRA factors. exllamav3 layout:
+                    #   a: (in_features, rank), b: (rank, out_features)
+                    #   forward: output += x @ a @ b
+                    # We optimise on the unpadded slice.
+                    a_slot = module.lora_a_tensors[self._lora_key]
+                    b_slot = module.lora_b_tensors[self._lora_key]
+
+                    # Create fp32 parameter copies for the optimizer.
+                    a_param = a_slot[:in_u, :rank].float().clone().detach().requires_grad_(True)
+                    b_param = b_slot[:rank, :out_u].float().clone().detach().requires_grad_(True)
+
+                    good_input, good_output = good_module_io[layer_index][component][module_index]
+                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
+
+                    good_input = good_input.float().to(device)
+                    good_output = good_output.float().to(device)
+                    bad_input = bad_input.float().to(device)
+                    bad_output = bad_output.float().to(device)
+
+                    def objective(A: Tensor, B: Tensor) -> Tensor:
+                        # EXL3 convention: W is (in, out), forward is x @ W.
+                        W_eff = W_base + A @ B
+
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            # Column-wise normalisation (dim=0) because W is (in, out).
+                            W_eff = F.normalize(W_eff, p=2, dim=0) * W_row_norms
+
+                        # x @ W_eff gives (batch, out_features).
+                        new_good_output = good_input @ W_eff
+                        new_bad_output = bad_input @ W_eff
+
+                        preserve_good_behavior = (
+                            (new_good_output - good_output) ** 2
+                        ).mean()
+
+                        steer_bad_behavior = (
+                            mean_distances_to_knn(
+                                new_bad_output,
+                                good_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                            + parameters.overcorrect_relative_weight
+                            * -mean_distances_to_knn(
+                                new_bad_output,
+                                bad_output,
+                                parameters.neighbor_count,
+                            ).mean()
+                        )
+
+                        return (
+                            parameters.preserve_good_behavior_weight
+                            * preserve_good_behavior
+                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
+                        )
+
+                    optimizer = LBFGS(
+                        [a_param, b_param],
+                        lr=1.0,
+                        max_iter=20,
+                        history_size=10,
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def closure():
+                        optimizer.zero_grad()
+                        loss = objective(a_param, b_param)
+                        loss.backward()
+                        return loss
+
+                    for step in range(5):
+                        optimizer.step(closure)
+
+                    # Write optimised values back into the pre-allocated slots.
+                    with torch.no_grad():
+                        a_slot.zero_()
+                        b_slot.zero_()
+                        a_slot[:in_u, :rank].copy_(a_param.to(torch.float16))
+                        b_slot[:rank, :out_u].copy_(b_param.to(torch.float16))
 
     # ------------------------------------------------------------------
     # Forward passes: residuals + logprobs

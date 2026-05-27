@@ -99,6 +99,19 @@ kl_divergence_scale = 1.0
 # This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".
 kl_divergence_target = 0.01
 
+# Whether to use Arbitrary-Rank Ablation (ARA), an abliteration method based on
+# matrix optimization, instead of traditional directional ablation.
+use_ara = false
+
+# Use LoRA in ARA instead of full-weight editing. Makes ARA compatible with
+# quantization and removes model reloads between trials.
+# Based on work by kabachuha (https://github.com/p-e-w/heretic/pull/332).
+use_ara_lora = false
+
+# If LoRA is used in ARA, this sets its rank. Keep it high enough to simulate
+# the 'arbitrary' effect.
+ara_lora_rank = 128
+
 # Whether to adjust the refusal directions so that only the component that is
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true

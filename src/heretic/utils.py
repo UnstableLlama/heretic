@@ -259,17 +259,32 @@ def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
+def mean_distances_to_knn(
+    queries: torch.Tensor,
+    targets: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """Mean Euclidean distance from each query to its k nearest neighbours in targets."""
+    dists = torch.cdist(queries, targets, p=2)
+    topk = dists.topk(min(k, dists.shape[1]), dim=1, largest=False)
+    return topk.values.mean(dim=1)
+
+
 def get_trial_parameters(trial: Trial) -> dict[str, str]:
     params = {}
 
-    direction_index = trial.user_attrs["direction_index"]
-    params["direction_index"] = (
-        "per layer" if (direction_index is None) else f"{direction_index:.2f}"
-    )
+    if "ara_parameters" in trial.user_attrs:
+        for name, value in trial.user_attrs["ara_parameters"].items():
+            params[name] = f"{value:.4f}" if isinstance(value, float) else str(value)
+    else:
+        direction_index = trial.user_attrs["direction_index"]
+        params["direction_index"] = (
+            "per layer" if (direction_index is None) else f"{direction_index:.2f}"
+        )
 
-    for component, parameters in trial.user_attrs["parameters"].items():
-        for name, value in parameters.items():
-            params[f"{component}.{name}"] = f"{value:.2f}"
+        for component, parameters in trial.user_attrs["parameters"].items():
+            for name, value in parameters.items():
+                params[f"{component}.{name}"] = f"{value:.2f}"
 
     return params
 
