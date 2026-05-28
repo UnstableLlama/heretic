@@ -252,11 +252,15 @@ class Exl3Model:
         Multi-GPU in exllamav3 is controlled by parameters to ``load()``
         (which forwards to ``load_gen()``), not by ``Config`` attributes:
 
-        * ``tensor_p=True``         — tensor parallelism; every GPU is active
-                                      on every forward pass.
         * ``use_per_device=[...]``  — explicit GB budget per device (layer split).
         * ``reserve_per_device``    — GB to reserve per device; lets exllamav3
                                       auto-split layers across all visible GPUs.
+
+        Note: we deliberately do not expose exllamav3's tensor-parallel mode
+        (``tensor_p=True``). TP routes forward passes through ``forward_tp``,
+        which bypasses the per-block forward hooks Heretic installs to capture
+        residuals and module I/O, so the abliteration analysis pass captures
+        nothing. The layer split already places weights on every GPU.
 
         We introspect the installed ``load_gen`` signature and only pass
         arguments it actually accepts, so this stays compatible across
@@ -281,18 +285,7 @@ class Exl3Model:
                 + ", ".join(f"[{i}] {name}" for i, name in enumerate(gpu_names))
             )
 
-        if self.settings.exl3_tensor_parallel and gpu_count > 1:
-            if "tensor_p" in accepted:
-                kwargs["tensor_p"] = True
-                print(
-                    f"* EXL3 tensor parallelism enabled across [bold]{gpu_count}[/] GPUs"
-                )
-            else:
-                print(
-                    "[yellow]* WARNING:[/] installed exllamav3 has no 'tensor_p' "
-                    "parameter; cannot enable tensor parallelism."
-                )
-        elif self.settings.exl3_gpu_split is not None:
+        if self.settings.exl3_gpu_split is not None:
             if "use_per_device" in accepted:
                 kwargs["use_per_device"] = self.settings.exl3_gpu_split
                 print(
@@ -307,8 +300,7 @@ class Exl3Model:
         elif gpu_count > 1 and "reserve_per_device" in accepted:
             # Let exllamav3 spread layers across all visible GPUs. Note that a
             # model small enough to fit on one GPU may still land entirely on
-            # the first device; use exl3_tensor_parallel or exl3_gpu_split to
-            # force both GPUs into active use.
+            # the first device; use exl3_gpu_split to force a particular split.
             kwargs["reserve_per_device"] = self.settings.exl3_reserve_per_device
             print(
                 f"* EXL3 auto-split across [bold]{gpu_count}[/] GPUs "

@@ -108,15 +108,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    exl3_tensor_parallel: bool = Field(
-        default=False,
-        description=(
-            "EXL3 backend only: load the model with tensor parallelism so that "
-            "every visible GPU is active on each forward pass. Requires more than "
-            "one GPU. Takes precedence over exl3_gpu_split."
-        ),
-    )
-
     exl3_gpu_split: list[float] | None = Field(
         default=None,
         description=(
