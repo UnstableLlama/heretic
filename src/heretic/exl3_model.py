@@ -973,8 +973,21 @@ class Exl3Model:
                 "Residual hooks may not be installed correctly."
             )
         # Each state is (B, T, H). Take the last position. Stack to (B, L, H).
+        #
+        # With a multi-GPU layer split, each block's captured output lives on
+        # that block's device, so the per-layer states span several GPUs.
+        # Consolidate onto a single device before stacking, or torch.stack
+        # raises a device-mismatch error. When offloading is enabled (the
+        # default) we go straight to CPU; otherwise we gather onto the first
+        # state's device.
+        target_device = (
+            torch.device("cpu")
+            if self.settings.offload_outputs_to_cpu
+            else states[0].device
+        )
         residuals = torch.stack(
-            [s[:, -1, :].to(torch.float32) for s in states], dim=1
+            [s[:, -1, :].to(device=target_device, dtype=torch.float32) for s in states],
+            dim=1,
         )
 
         if 0 <= self.settings.winsorization_quantile < 1:
