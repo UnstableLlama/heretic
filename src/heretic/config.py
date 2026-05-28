@@ -108,6 +108,32 @@ class Settings(BaseSettings):
         ),
     )
 
+    exl3_tensor_parallel: bool = Field(
+        default=False,
+        description=(
+            "EXL3 backend only: load the model with tensor parallelism so that "
+            "every visible GPU is active on each forward pass. Requires more than "
+            "one GPU. Takes precedence over exl3_gpu_split."
+        ),
+    )
+
+    exl3_gpu_split: list[float] | None = Field(
+        default=None,
+        description=(
+            "EXL3 backend only: explicit per-device memory budget in GB used to "
+            'split the model across GPUs (e.g. [20.0, 20.0]). If not set, '
+            "exllamav3 auto-splits across all visible devices."
+        ),
+    )
+
+    exl3_reserve_per_device: float = Field(
+        default=0.5,
+        description=(
+            "EXL3 backend only: gigabytes of VRAM to reserve per device when "
+            "auto-splitting the model across multiple GPUs."
+        ),
+    )
+
     model_commit: str | None = Field(
         default=None,
         description="Hugging Face commit hash of the model.",
