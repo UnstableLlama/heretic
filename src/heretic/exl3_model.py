@@ -174,6 +174,7 @@ class Exl3Model:
         # doesn't depend on which symbols __init__.py happens to re-export
         # (this varies between PyPI releases and the master branch).
         self._exl_api = self._resolve_exllamav3_api()
+        self._patch_gemma4_device_bug()
 
         print()
         print(
@@ -365,6 +366,58 @@ class Exl3Model:
                 "report the package version and __init__.py contents."
             )
         return resolved
+
+    @staticmethod
+    def _patch_gemma4_device_bug() -> None:
+        # Work around an upstream exllamav3 device-placement bug in the Gemma 4
+        # architecture (present through master as of this writing). Its
+        # _prepare_noncausal_mm_spans builds boundary tensors with bare
+        # torch.tensor([...]) calls (which default to CPU) and concatenates
+        # them with change_points, derived from input_ids and therefore on the
+        # model's CUDA device. This raises "Expected all tensors to be on the
+        # same device" the moment Heretic calls model.forward() directly (for
+        # logprobs/residuals), even though exllamav3's own generator path
+        # avoids it. We replace the function with a device-correct copy.
+        # Guarded and idempotent, so it is a no-op on versions without the bug.
+        try:
+            from exllamav3.architecture import gemma4 as g
+        except Exception:
+            return
+
+        if getattr(g, "_heretic_device_patch", False):
+            return
+        if not hasattr(g, "_prepare_noncausal_mm_spans"):
+            return
+
+        def _prepare_noncausal_mm_spans(input_ids, params):
+            length = len(input_ids[0])
+            if length == 1:
+                return
+            ids = input_ids[0]
+            mask = ids >= g.FIRST_MM_EMBEDDING_INDEX
+            change_points = (
+                torch.nonzero(mask[1:] != mask[:-1], as_tuple=True)[0] + 1
+            )
+            boundaries = torch.cat(
+                [
+                    torch.tensor([0], device=ids.device),
+                    change_points,
+                    torch.tensor([length], device=ids.device),
+                ]
+            )
+            values = mask[boundaries[:-1]]
+            spans = [
+                (int(start), int(end), bool(val))
+                for start, end, val in zip(boundaries[:-1], boundaries[1:], values)
+            ]
+            if (len(spans) > 0 and spans[0][2]) or len(spans) > 1:
+                assert input_ids.shape[0] == 1, (
+                    "Gemma4 does not support batched multimodal prefill"
+                )
+                params["non_causal_spans"] = spans
+
+        g._prepare_noncausal_mm_spans = _prepare_noncausal_mm_spans
+        g._heretic_device_patch = True
 
     def _discover_modules(self, *, allocate_lora_slots: bool = True) -> None:
         """Walk the loaded model, find o_proj / down_proj Linears, group
