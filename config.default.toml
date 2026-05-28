@@ -26,6 +26,20 @@ quantization = "none"
 # If unset, Heretic infers from EXL3 model directory metadata.
 # exl3_base_model = "meta-llama/Llama-3.2-1B-Instruct"
 
+# EXL3 backend only: load with tensor parallelism so every visible GPU is
+# active on each forward pass. Requires more than one GPU. Takes precedence
+# over exl3_gpu_split.
+exl3_tensor_parallel = false
+
+# EXL3 backend only: explicit per-device memory budget in GB to split the
+# model across GPUs (e.g. [20.0, 20.0]). If unset, exllamav3 auto-splits
+# across all visible devices.
+# exl3_gpu_split = [20.0, 20.0]
+
+# EXL3 backend only: GB of VRAM to reserve per device when auto-splitting
+# the model across multiple GPUs.
+exl3_reserve_per_device = 0.5
+
 # Device map to pass to Accelerate when loading the model.
 device_map = "auto"
 

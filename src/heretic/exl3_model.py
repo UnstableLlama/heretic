@@ -40,6 +40,7 @@ Design notes (see HANDOFF_EXL3.md):
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import math
 import re
@@ -184,7 +185,6 @@ class Exl3Model:
 
         model_path = str(Path(settings.model).expanduser())
         self.config = self._exl_api["Config"].from_directory(model_path)
-        self._configure_multi_gpu_loading()
         self.model = self._exl_api["Model"].from_config(self.config)
 
         if inspect_only:
@@ -208,7 +208,7 @@ class Exl3Model:
             self.cache = self._exl_api["Cache"](
                 self.model, max_num_tokens=max_num_tokens
             )
-            self.model.load(progressbar=True)
+            self.model.load(**self._build_load_kwargs())
             self._report_loaded_devices()
 
             exl3_tok = self._exl_api["Tokenizer"].from_config(self.config)
@@ -245,49 +245,84 @@ class Exl3Model:
     # Loading helpers
     # ------------------------------------------------------------------
 
-    def _configure_multi_gpu_loading(self) -> None:
-        """Best-effort multi-GPU configuration for exllamav3.
+    def _build_load_kwargs(self) -> dict[str, Any]:
+        """Build keyword arguments for ``Model.load()`` controlling device
+        placement across GPUs.
 
-        exllamav3 has changed config field names across versions. We therefore
-        probe several known/likely attributes and set whichever exist.
+        Multi-GPU in exllamav3 is controlled by parameters to ``load()``
+        (which forwards to ``load_gen()``), not by ``Config`` attributes:
+
+        * ``tensor_p=True``         — tensor parallelism; every GPU is active
+                                      on every forward pass.
+        * ``use_per_device=[...]``  — explicit GB budget per device (layer split).
+        * ``reserve_per_device``    — GB to reserve per device; lets exllamav3
+                                      auto-split layers across all visible GPUs.
+
+        We introspect the installed ``load_gen`` signature and only pass
+        arguments it actually accepts, so this stays compatible across
+        exllamav3 versions (the parameter set has changed over time).
         """
-        if not torch.cuda.is_available():
-            return
+        kwargs: dict[str, Any] = {"progressbar": True}
 
-        gpu_count = torch.cuda.device_count()
-        if gpu_count <= 1:
-            return
-
-        print(f"* CUDA devices visible to Heretic: [bold]{gpu_count}[/]")
-        gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
-        print("* CUDA device list: " + ", ".join(f"[{i}] {name}" for i, name in enumerate(gpu_names)))
-
-        touched: list[str] = []
-        candidates: list[tuple[str, Any]] = [
-            ("gpu_split", [1.0] * gpu_count),
-            ("gpu_split_auto", True),
-            ("auto_gpu_split", True),
-            ("auto_split", True),
-            ("tp", gpu_count),
-            ("tensor_parallel", gpu_count),
-            ("num_gpus", gpu_count),
-        ]
-
-        for attr, value in candidates:
-            if hasattr(self.config, attr):
-                setattr(self.config, attr, value)
-                touched.append(attr)
-
-        if touched:
-            print(
-                "* EXL3 multi-GPU hints applied: "
-                + ", ".join(f"[bold]{name}[/]" for name in touched)
+        try:
+            accepted = set(
+                inspect.signature(self.model.load_gen).parameters  # ty:ignore[possibly-missing-attribute]
             )
-        else:
+        except (AttributeError, ValueError, TypeError):
+            accepted = set()
+
+        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+        if gpu_count > 1:
+            gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
+            print(f"* CUDA devices visible to Heretic: [bold]{gpu_count}[/]")
             print(
-                "[yellow]* WARNING:[/] EXL3 config exposes no known multi-GPU knobs; "
-                "continuing with exllamav3 defaults."
+                "* CUDA device list: "
+                + ", ".join(f"[{i}] {name}" for i, name in enumerate(gpu_names))
             )
+
+        if self.settings.exl3_tensor_parallel and gpu_count > 1:
+            if "tensor_p" in accepted:
+                kwargs["tensor_p"] = True
+                print(
+                    f"* EXL3 tensor parallelism enabled across [bold]{gpu_count}[/] GPUs"
+                )
+            else:
+                print(
+                    "[yellow]* WARNING:[/] installed exllamav3 has no 'tensor_p' "
+                    "parameter; cannot enable tensor parallelism."
+                )
+        elif self.settings.exl3_gpu_split is not None:
+            if "use_per_device" in accepted:
+                kwargs["use_per_device"] = self.settings.exl3_gpu_split
+                print(
+                    "* EXL3 explicit GPU split (GB/device): "
+                    f"[bold]{self.settings.exl3_gpu_split}[/]"
+                )
+            else:
+                print(
+                    "[yellow]* WARNING:[/] installed exllamav3 has no "
+                    "'use_per_device' parameter; ignoring exl3_gpu_split."
+                )
+        elif gpu_count > 1 and "reserve_per_device" in accepted:
+            # Let exllamav3 spread layers across all visible GPUs. Note that a
+            # model small enough to fit on one GPU may still land entirely on
+            # the first device; use exl3_tensor_parallel or exl3_gpu_split to
+            # force both GPUs into active use.
+            kwargs["reserve_per_device"] = self.settings.exl3_reserve_per_device
+            print(
+                f"* EXL3 auto-split across [bold]{gpu_count}[/] GPUs "
+                f"(reserving {self.settings.exl3_reserve_per_device} GB/device)"
+            )
+
+        # Drop anything the installed version doesn't understand (keep
+        # progressbar, which every known version accepts).
+        if accepted:
+            kwargs = {
+                k: v for k, v in kwargs.items() if k == "progressbar" or k in accepted
+            }
+
+        return kwargs
 
     def _report_loaded_devices(self) -> None:
         """Log where exllamav3 actually placed modules after load."""
@@ -901,16 +936,14 @@ class Exl3Model:
             padding=True,
             return_token_type_ids=False,
         )
-        input_ids = enc["input_ids"].to(self._first_device())
-        return input_ids
-
-    def _first_device(self) -> torch.device:
-        # Pick the device of any loaded module (model may be sharded).
-        for per_layer in self._layer_modules:
-            for modules in per_layer.values():
-                for module in modules:
-                    return module.device
-        return torch.device("cuda:0")
+        # IMPORTANT: keep input_ids on CPU. exllamav3's Model.forward expects
+        # CPU token ids (its own generator feeds them that way) and moves
+        # activations onto the compute device internally. The architecture's
+        # prepare_inputs helpers (prepare_for_attn, Gemma 4's mm-span builder,
+        # etc.) construct index tensors on CPU with no explicit device and then
+        # combine them with tensors derived from input_ids; passing input_ids
+        # on CUDA triggers "Expected all tensors to be on the same device".
+        return enc["input_ids"]
 
     def _forward(self, input_ids: Tensor, *, last_only: bool = False) -> tuple[Tensor, list[Tensor]]:
         """Run a single forward pass. Returns (logits, export_states)
