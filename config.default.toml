@@ -35,6 +35,13 @@ quantization = "none"
 # the model across multiple GPUs.
 exl3_reserve_per_device = 0.5
 
+# EXL3 backend only: column-slice width (in output features) for computing the
+# abliteration update. The effective weight is reconstructed and consumed in
+# slices of this width instead of being materialized in full, bounding the peak
+# VRAM of the abliteration pass. Lower = less VRAM, more reconstruction calls;
+# higher = the reverse. Rounded up to a multiple of 128.
+exl3_reconstruct_slice_n = 4096
+
 # Device map to pass to Accelerate when loading the model.
 device_map = "auto"
 

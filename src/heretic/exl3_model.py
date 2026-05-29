@@ -645,26 +645,26 @@ class Exl3Model:
         out_u = module.out_features_unpadded
         device = module.device
 
-        # Dequantize the actual functional weight. quant_type == "fp16"
-        # falls back to the stored fp16 tensor.
+        v_u = v[:out_u].to(device=device, dtype=torch.float32)
+
+        # Compute A = W_eff @ v, the only thing the LoRA update needs from the
+        # weight. quant_type == "fp16" stores the effective weight directly;
+        # "exl3" folds the EXL3 transforms onto vectors and streams the
+        # reconstruction so the full effective weight is never materialized
+        # (see _ablation_a_exl3).
         if module.quant_type == "exl3":
-            # LinearEXL3.get_weight_tensor() -> (in_p, out_p) fp16
-            W = module.inner.get_weight_tensor()
+            A_unpad = self._ablation_a_exl3(module.inner, v, in_u).unsqueeze(-1)
         elif module.quant_type == "fp16":
             # LinearFP16 stores .weight directly; same (in_p, out_p) layout
             # because exllamav3 keeps everything in input-major form for
             # its kernels.
             W = module.inner.weight
+            A_unpad = (W[:in_u, :out_u].to(torch.float32) @ v_u).unsqueeze(-1)
         else:
             raise RuntimeError(
                 f"Unknown Linear.quant_type {module.quant_type!r} on {module.key}"
             )
 
-        v_u = v[:out_u].to(device=device, dtype=torch.float32)
-
-        # Compute on the unpadded slice in fp32, then zero-pad and cast.
-        W_unpad = W[:in_u, :out_u].to(torch.float32)
-        A_unpad = (W_unpad @ v_u).unsqueeze(-1)         # (in_u, 1)
         B_unpad = (-kernel_weight * v_u).unsqueeze(0)   # (1, out_u)
 
         a_slot = module.lora_a_tensors[self._lora_key]
@@ -674,6 +674,92 @@ class Exl3Model:
         b_slot.zero_()
         a_slot[:in_u, :1].copy_(A_unpad.to(torch.float16))
         b_slot[:1, :out_u].copy_(B_unpad.to(torch.float16))
+
+    def _exl3_ext(self) -> Any:
+        """The exllamav3 C extension, resolved lazily and cached.
+
+        We reuse the exact ``ext`` object that ``exllamav3.modules.quant.exl3``
+        binds, so we call the identical kernels the forward pass uses
+        (``reconstruct_slice``, ``had_r_128``) rather than guessing the
+        extension's import path.
+        """
+        ext = getattr(self, "_ext_cached", None)
+        if ext is None:
+            ext = importlib.import_module("exllamav3.modules.quant.exl3").ext
+            self._ext_cached = ext
+        return ext
+
+    def _exl3_slice_width(self) -> int:
+        """Column-slice width for streaming reconstruction, rounded up to a
+        multiple of 128 (both the trellis tiling and the Hadamard block size
+        divide 128, and EXL3 ``out_features`` is itself a multiple of 128, so
+        every slice boundary stays aligned)."""
+        n = int(self.settings.exl3_reconstruct_slice_n)
+        return max(128, ((n + 127) // 128) * 128)
+
+    def _ablation_a_exl3(self, inner: Any, v: Tensor, in_u: int) -> Tensor:
+        """Compute ``A = W_eff @ v`` for one EXL3 layer without ever building
+        the full effective weight.
+
+        exllamav3's ``LinearEXL3.get_weight_tensor`` forms
+
+            W_eff = diag(suh) . H_L . w . H_R . diag(svh)
+
+        where ``w`` is the raw trellis reconstruction (in, out), ``H_L``/``H_R``
+        are the block-128 Hadamards (scaled 1/sqrt(128)) on the input/output
+        dims, and ``suh``/``svh`` are the input/output scales. Building that
+        transiently upcasts the whole matrix to fp32 twice — the allocation
+        that OOMs a busy GPU.
+
+        Abliteration only needs ``A = W_eff @ v``, so by associativity we fold
+        the output-side transform onto the vector ``v`` and the input-side
+        transform onto the result:
+
+            u = H_R . (svh . v)          # had_r_128(v, pre_scale=svh)
+            c = w . u                    # streamed in column slices
+            A = suh . (H_L . c)          # had_r_128(c, post_scale=suh)
+
+        Both Hadamard+scale steps are exactly ``ext.had_r_128`` (the kernel the
+        forward pass calls), and ``w . u`` is accumulated over ``ext``-
+        reconstructed column slices of ``w`` so the full weight never exists at
+        once. The reduction is done in fp32 to match the previous fp32 path.
+
+        Returns the unpadded ``(in_u,)`` update vector in fp32.
+        """
+        ext = self._exl3_ext()
+        device = inner.trellis.device
+        in_f = inner.in_features      # padded
+        out_f = inner.out_features    # padded
+
+        # --- Output side: u = H_R . (svh (.) v), length out_f. ---
+        v_pad = torch.zeros((1, out_f), dtype=torch.float16, device=device)
+        out_u = min(int(v.shape[0]), out_f)
+        v_pad[0, :out_u] = v[:out_u].to(device=device, dtype=torch.float16)
+        u = torch.empty((1, out_f), dtype=torch.float16, device=device)
+        # had_r_128(input, output, pre_scale, post_scale, scale):
+        #   output = FWHT(input (.) pre_scale) * (1/sqrt(128)) * post_scale
+        ext.had_r_128(v_pad, u, inner.svh, None, 1.0)
+        u_f32 = u.view(out_f).to(torch.float32)
+
+        # --- c = w . u, streamed in column slices, accumulated in fp32. ---
+        width = self._exl3_slice_width()
+        c = torch.zeros(in_f, dtype=torch.float32, device=device)
+        w_buf = torch.empty(
+            (in_f, min(width, out_f)), dtype=torch.float16, device=device
+        )
+        for n0 in range(0, out_f, width):
+            n1 = min(n0 + width, out_f)
+            w = w_buf[:, : n1 - n0]
+            ext.reconstruct_slice(
+                w, inner.trellis, inner.K, inner.mcg, inner.mul1, n0
+            )
+            c += w.to(torch.float32) @ u_f32[n0:n1]
+
+        # --- Input side: A = suh (.) (H_L . c), length in_f. ---
+        c16 = c.to(torch.float16).view(1, in_f)
+        a = torch.empty((1, in_f), dtype=torch.float16, device=device)
+        ext.had_r_128(c16, a, None, inner.suh, 1.0)
+        return a.view(in_f)[:in_u].to(torch.float32)
 
     def reset_model(self) -> None:
         """Zero all LoRA contributions. The current model stays loaded; no
