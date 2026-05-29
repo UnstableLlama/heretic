@@ -908,9 +908,25 @@ class Exl3Model:
                     a_slot = module.lora_a_tensors[self._lora_key]
                     b_slot = module.lora_b_tensors[self._lora_key]
 
-                    # Create fp32 parameter copies for the optimizer.
-                    a_param = a_slot[:in_u, :rank].float().clone().detach().requires_grad_(True)
-                    b_param = b_slot[:rank, :out_u].float().clone().detach().requires_grad_(True)
+                    # Create fp32 optimizer parameters. Mirror PEFT's LoRA
+                    # init: A nonzero (kaiming), B zero. The update is the
+                    # bilinear product A@B, whose gradient is zero in *both*
+                    # factors at the origin -- if both started at zero (as the
+                    # slots do), LBFGS would see a zero gradient and never move,
+                    # leaving the LoRA an identity (KL 0, no abliteration).
+                    # Nonzero A keeps the product zero initially (no perturbation
+                    # to the base output) while letting gradients flow into B.
+                    a_param = torch.empty(
+                        (in_u, rank), dtype=torch.float32, device=device
+                    )
+                    torch.nn.init.kaiming_uniform_(a_param, a=math.sqrt(5))
+                    a_param = a_param.detach().requires_grad_(True)
+                    b_param = torch.zeros(
+                        (rank, out_u),
+                        dtype=torch.float32,
+                        device=device,
+                        requires_grad=True,
+                    )
 
                     good_input, good_output = good_module_io[layer_index][component][module_index]
                     bad_input, bad_output = bad_module_io[layer_index][component][module_index]
