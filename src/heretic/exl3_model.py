@@ -1012,11 +1012,29 @@ class Exl3Model:
                         optimizer.step(closure)
 
                     # Write optimised values back into the pre-allocated slots.
+                    # The ARA overcorrection objective is unbounded below (it
+                    # rewards pushing bad outputs arbitrarily far), so LBFGS can
+                    # drive ||A@B|| large; combined with LoRA's scale degeneracy
+                    # (A@B is invariant under A->cA, B->B/c) the factors can blow
+                    # past fp16 range, giving nan logits at eval. If the update
+                    # isn't finite once cast to the fp16 storage dtype, skip it
+                    # (leave the slot zeroed = no-op for this module) so the
+                    # trial yields a clean finite score instead of poisoning the
+                    # evaluation with nan.
                     with torch.no_grad():
                         a_slot.zero_()
                         b_slot.zero_()
-                        a_slot[:in_u, :rank].copy_(a_param.to(torch.float16))
-                        b_slot[:rank, :out_u].copy_(b_param.to(torch.float16))
+                        a16 = a_param.to(torch.float16)
+                        b16 = b_param.to(torch.float16)
+                        if torch.isfinite(a16).all() and torch.isfinite(b16).all():
+                            a_slot[:in_u, :rank].copy_(a16)
+                            b_slot[:rank, :out_u].copy_(b16)
+                        else:
+                            print(
+                                "[yellow]WARNING:[/] non-finite ARA-LoRA update on "
+                                f"[bold]{module.key}[/]; skipping this module "
+                                "(check overcorrect_relative_weight)."
+                            )
 
     # ------------------------------------------------------------------
     # Forward passes: residuals + logprobs
