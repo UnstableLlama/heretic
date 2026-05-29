@@ -4,7 +4,7 @@
 from enum import Enum
 from typing import Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
@@ -354,6 +354,17 @@ class Settings(BaseSettings):
             "Keep it high enough to simulate the 'arbitrary' effect."
         ),
     )
+
+    @model_validator(mode="after")
+    def _ara_lora_implies_ara(self) -> "Settings":
+        # ARA LoRA is a sub-mode of ARA: the module-I/O collection and ARA
+        # parameter suggestion are gated on use_ara, but the abliteration
+        # dispatch enters the LoRA branch on use_ara_lora alone. Passing
+        # --use-ara-lora without --use-ara would otherwise crash with a
+        # NameError on good_module_io. Treat use_ara_lora as implying use_ara.
+        if self.use_ara_lora:
+            self.use_ara = True
+        return self
 
     orthogonalize_direction: bool = Field(
         default=True,
