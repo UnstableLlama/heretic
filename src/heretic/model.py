@@ -766,11 +766,19 @@ class Model:
                             ).mean()
                         )
 
-                        return (
+                        loss = (
                             parameters.preserve_good_behavior_weight
                             * preserve_good_behavior
                             + parameters.steer_bad_behavior_weight * steer_bad_behavior
                         )
+                        # Optional L2 regularization on the LoRA factors (see
+                        # ara_lora_regularization). Bounds the unbounded
+                        # overcorrection objective and the A@B scale degeneracy.
+                        # Disabled when the strength is 0.
+                        reg = self.settings.ara_lora_regularization
+                        if reg:
+                            loss = loss + reg * (A.pow(2).mean() + B.pow(2).mean())
+                        return loss
 
                     optimizer = LBFGS(
                         [lora_A, lora_B],
