@@ -523,6 +523,13 @@ class Exl3Model:
 
         def _make_wrapper(orig: Any, capture_input: bool) -> Any:
             def wrapped(x, params, out_dtype=None):
+                # Residual capture is opt-in (params["capture_residuals"]).
+                # Otherwise every block would clone its full (B, T, H) hidden
+                # state to the GPU on *every* forward -- including the module-I/O
+                # and logprob passes that don't use residuals at all -- which
+                # can exhaust VRAM on a tightly-split model.
+                if not params.get("capture_residuals"):
+                    return orig(x, params, out_dtype=out_dtype)
                 states = params.get("export_states")
                 if states is None:
                     states = params["export_states"] = []
@@ -1051,7 +1058,13 @@ class Exl3Model:
         # on CUDA triggers "Expected all tensors to be on the same device".
         return enc["input_ids"]
 
-    def _forward(self, input_ids: Tensor, *, last_only: bool = False) -> tuple[Tensor, list[Tensor]]:
+    def _forward(
+        self,
+        input_ids: Tensor,
+        *,
+        last_only: bool = False,
+        capture_residuals: bool = False,
+    ) -> tuple[Tensor, list[Tensor]]:
         """Run a single forward pass. Returns (logits, export_states)
         where logits is (B, T_out, vocab) and export_states is a list of
         (B, T, H) tensors (one per captured point: embed-out + per-block).
@@ -1065,6 +1078,8 @@ class Exl3Model:
         params: dict[str, Any] = {}
         if last_only:
             params["last_tokens_only"] = 1
+        if capture_residuals:
+            params["capture_residuals"] = True
         with torch.inference_mode():
             logits = self.model.forward(input_ids, params=params)
         states = params.get("export_states", [])
@@ -1072,7 +1087,7 @@ class Exl3Model:
 
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
         input_ids = self._tokenize_chat(prompts)
-        _, states = self._forward(input_ids, last_only=False)
+        _, states = self._forward(input_ids, last_only=False, capture_residuals=True)
         if len(states) != self._num_layers + 1:
             raise RuntimeError(
                 f"Expected {self._num_layers + 1} captured residuals, got {len(states)}. "
