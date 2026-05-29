@@ -901,9 +901,6 @@ class Exl3Model:
                     out_u = module.out_features_unpadded
                     device = module.device
 
-                    W_base = self._dequantize_weight(module).to(device)
-                    W_row_norms = LA.vector_norm(W_base, dim=0, keepdim=True).detach()
-
                     # The optimisable LoRA factors. exllamav3 layout:
                     #   a: (in_features, rank), b: (rank, out_features)
                     #   forward: output += x @ a @ b
@@ -923,17 +920,32 @@ class Exl3Model:
                     bad_input = bad_input.float().to(device)
                     bad_output = bad_output.float().to(device)
 
-                    def objective(A: Tensor, B: Tensor) -> Tensor:
-                        # EXL3 convention: W is (in, out), forward is x @ W.
-                        W_eff = W_base + A @ B
+                    # Norm-preserving (FULL) needs the full effective weight, so
+                    # it must be dequantized. Every other mode factors the LoRA
+                    # delta onto the captured outputs (see objective below) and
+                    # never materializes the (in, out) weight — far less VRAM.
+                    normalize = (
+                        self.settings.row_normalization == RowNormalization.FULL
+                    )
+                    if normalize:
+                        W_base = self._dequantize_weight(module).to(device)
+                        W_row_norms = LA.vector_norm(W_base, dim=0, keepdim=True).detach()
 
-                        if self.settings.row_normalization == RowNormalization.FULL:
+                    def objective(A: Tensor, B: Tensor) -> Tensor:
+                        if normalize:
+                            # EXL3 convention: W is (in, out), forward is x @ W.
+                            W_eff = W_base + A @ B
                             # Column-wise normalisation (dim=0) because W is (in, out).
                             W_eff = F.normalize(W_eff, p=2, dim=0) * W_row_norms
-
-                        # x @ W_eff gives (batch, out_features).
-                        new_good_output = good_input @ W_eff
-                        new_bad_output = bad_input @ W_eff
+                            new_good_output = good_input @ W_eff
+                            new_bad_output = bad_input @ W_eff
+                        else:
+                            # Factored form. The captured *_output is the module's
+                            # original output (LoRA was zero at capture), so
+                            #   input @ (W_base + A@B) = captured_output + (input@A)@B
+                            # holds without ever building the (in, out) weight.
+                            new_good_output = good_output + (good_input @ A) @ B
+                            new_bad_output = bad_output + (bad_input @ A) @ B
 
                         preserve_good_behavior = (
                             (new_good_output - good_output) ** 2
