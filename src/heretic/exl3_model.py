@@ -74,14 +74,14 @@ from .utils import Prompt, batchify, mean_distances_to_knn, print
 # the LM under a vision/audio wrapper. The leaf suffix matches both
 # ``o_proj`` (standard) and ``out_proj`` (hybrid linear-attention).
 _MODULE_KEY_REGEX = re.compile(
-    r"^model(?:\.language_model)?\.layers\.(\d+)\..*?\.(o_proj|out_proj|down_proj)(?:\.slice\.\d+)?$"
+    r"^(?:model(?:\.language_model)?|language_model\.model)\.layers\.(\d+)\..*?\.(o_proj|out_proj|down_proj)(?:\.slice\.\d+)?$"
 )
 
 # Block-level keys, used to find decoder layers without depending on
 # isinstance(TransformerBlock) (some architectures use custom block
 # classes).
 _BLOCK_KEY_REGEX = re.compile(
-    r"^model(?:\.language_model)?\.layers\.(\d+)$"
+    r"^(?:model(?:\.language_model)?|language_model\.model)\.layers\.(\d+)$"
 )
 
 
