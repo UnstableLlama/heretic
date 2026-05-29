@@ -125,6 +125,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    exl3_reconstruct_slice_n: int = Field(
+        default=4096,
+        description=(
+            "EXL3 backend only: column-slice width (in output features) used when "
+            "computing the abliteration update. Instead of materializing the full "
+            "effective weight matrix (which transiently upcasts to fp32 and can OOM "
+            "a busy GPU), the weight is reconstructed and consumed in column slices "
+            "of this width. Lower values reduce the peak VRAM of the abliteration "
+            "pass at the cost of more reconstruction calls; higher values do the "
+            "reverse. Rounded up to a multiple of 128."
+        ),
+    )
+
     model_commit: str | None = Field(
         default=None,
         description="Hugging Face commit hash of the model.",
