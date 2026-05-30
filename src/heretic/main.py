@@ -828,28 +828,32 @@ def run():
                 print(f"  * {name} = [bold]{value}[/]")
 
             def reset_trial_model() -> None:
+                # Re-applies the selected trial's parameters to the in-memory
+                # model so it matches that trial's state. This is a one-shot
+                # rebuild (the same single trial-step the optimizer ran), not
+                # a new optimization trial.
                 if settings.use_ara_lora:
-                    print("* Resetting model...")
+                    print("* Resetting model to base state...")
                     model.reset_model()
-                    print("* Abliterating (Arbitrary-Rank Ablation with LoRA)...")
+                    print("* Rebuilding LoRA from saved trial parameters (one-shot, not a new trial)...")
                     model.ara_lora_abliterate(
                         good_module_io,
                         bad_module_io,
                         ARAParameters(**trial.user_attrs["ara_parameters"]),
                     )
                 elif settings.use_ara:
-                    print("* Reloading model...")
+                    print("* Resetting model to base state...")
                     model.reset_model()
-                    print("* Abliterating (Arbitrary-Rank Ablation)...")
+                    print("* Re-applying ARA from saved trial parameters (one-shot, not a new trial)...")
                     model.ara_abliterate(
                         good_module_io,
                         bad_module_io,
                         ARAParameters(**trial.user_attrs["ara_parameters"]),
                     )
                 else:
-                    print("* Resetting model...")
+                    print("* Resetting model to base state...")
                     model.reset_model()
-                    print("* Abliterating...")
+                    print("* Re-applying abliteration from saved trial parameters (one-shot, not a new trial)...")
                     model.abliterate(
                         refusal_directions,
                         trial.user_attrs["direction_index"],
@@ -863,10 +867,22 @@ def run():
 
             while True:
                 print()
+                # In ARA-LoRA mode the LoRA adapter is the primary deliverable,
+                # so surface "save as adapter" and "save as merged model" as
+                # direct top-level choices instead of nesting them behind a
+                # second prompt. The strategy is then derived from the action.
+                if settings.use_ara_lora:
+                    save_choices = [
+                        "Save LoRA adapter to a local folder",
+                        "Save merged model to a local folder",
+                    ]
+                else:
+                    save_choices = ["Save the model to a local folder"]
+
                 action = prompt_select(
                     "What do you want to do with the decensored model?",
-                    [
-                        "Save the model to a local folder",
+                    save_choices
+                    + [
                         "Upload the model to Hugging Face",
                         "Chat with the model",
                         "Benchmark the model",
@@ -882,14 +898,23 @@ def run():
                 # the optimized model.
                 try:
                     match action:
-                        case "Save the model to a local folder":
+                        case (
+                            "Save the model to a local folder"
+                            | "Save LoRA adapter to a local folder"
+                            | "Save merged model to a local folder"
+                        ):
                             save_directory = prompt_path("Path to the folder:")
                             if not save_directory:
                                 continue
 
-                            strategy = obtain_merge_strategy(settings, model)
-                            if strategy is None:
-                                continue
+                            if action == "Save LoRA adapter to a local folder":
+                                strategy = "adapter"
+                            elif action == "Save merged model to a local folder":
+                                strategy = "merge"
+                            else:
+                                strategy = obtain_merge_strategy(settings, model)
+                                if strategy is None:
+                                    continue
 
                             merge_output_directory = save_directory
 
