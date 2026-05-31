@@ -355,6 +355,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    ara_lora_regularization: float = Field(
+        default=0.0,
+        description=(
+            "L2 regularization strength on the ARA LoRA factors A and B "
+            "(adds value * (mean(A^2) + mean(B^2)) to the optimization loss). "
+            "0 (the default) disables it. The ARA overcorrection objective is "
+            "unbounded below and LoRA has a scale degeneracy, so the factors can "
+            "blow up and overflow the fp16 forward (nan KL), especially on "
+            "low-bit quants. A small positive value (e.g. 1e-3) bounds the loss "
+            "and keeps the factors well-scaled; too large weakens abliteration."
+        ),
+    )
+
     @model_validator(mode="after")
     def _ara_lora_implies_ara(self) -> "Settings":
         # ARA LoRA is a sub-mode of ARA: the module-I/O collection and ARA
