@@ -110,9 +110,20 @@ class Evaluator:
         kl_divergence_scale = self.settings.kl_divergence_scale
         kl_divergence_target = self.settings.kl_divergence_target
 
-        refusals_score = (
-            refusals / self.base_refusals if self.base_refusals > 0 else float(refusals)
-        )
+        if self.settings.invert_target:
+            # Maximize behavior expression: lower score = more "refusals" (i.e.
+            # more expressions of the targeted behavior). Normalize against the
+            # remaining headroom (total - base_refusals) so the score still ranges
+            # ~[0, 1] and pairs cleanly with the kld_score's below-target branch.
+            total = len(self.bad_prompts)
+            headroom = total - self.base_refusals
+            refusals_score = (
+                (total - refusals) / headroom if headroom > 0 else float(total - refusals)
+            )
+        else:
+            refusals_score = (
+                refusals / self.base_refusals if self.base_refusals > 0 else float(refusals)
+            )
 
         if kl_divergence >= kl_divergence_target:
             kld_score = kl_divergence / kl_divergence_scale

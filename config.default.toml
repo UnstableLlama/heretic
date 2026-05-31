@@ -128,6 +128,14 @@ use_ara_lora = false
 # the 'arbitrary' effect.
 ara_lora_rank = 128
 
+# Invert the steering target: push "bad" outputs further from "good" and deeper
+# into the "bad" cluster (amplifying the targeted behavior) instead of the
+# default suppression. The Optuna refusals score is also inverted, so the outer
+# optimizer maximizes the behavior's expression. Applies to both ARA and
+# ARA-LoRA inner objectives. Useful for general behavioral steering when
+# good=neutral and bad=target behavior.
+invert_target = false
+
 # Whether to adjust the refusal directions so that only the component that is
 # orthogonal to the good direction is subtracted during abliteration.
 orthogonalize_direction = true

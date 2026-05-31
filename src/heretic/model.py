@@ -671,6 +671,8 @@ class Model:
                                 parameters.neighbor_count,
                             ).mean()
                         )
+                        if self.settings.invert_target:
+                            steer_bad_behavior = -steer_bad_behavior
 
                         return (
                             parameters.preserve_good_behavior_weight
@@ -765,6 +767,8 @@ class Model:
                                 parameters.neighbor_count,
                             ).mean()
                         )
+                        if self.settings.invert_target:
+                            steer_bad_behavior = -steer_bad_behavior
 
                         loss = (
                             parameters.preserve_good_behavior_weight
