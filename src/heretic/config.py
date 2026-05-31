@@ -368,6 +368,22 @@ class Settings(BaseSettings):
         ),
     )
 
+    invert_target: bool = Field(
+        default=False,
+        description=(
+            "Invert the steering target: instead of pushing 'bad' outputs toward "
+            "'good' outputs (suppressing the targeted behavior), push them further "
+            "from 'good' and deeper into the 'bad' cluster (amplifying the "
+            "targeted behavior). The Optuna refusals score is also inverted, so "
+            "the outer optimizer maximizes the behavior's expression. Useful for "
+            "general behavioral steering when 'good'='neutral' and 'bad'='target "
+            "behavior'. Applies to both ARA and ARA-LoRA inner objectives. "
+            "Like the default direction, the inner ARA objective is geometrically "
+            "unbounded; consider setting ara_lora_regularization to a small "
+            "positive value if A@B overflows fp16."
+        ),
+    )
+
     @model_validator(mode="after")
     def _ara_lora_implies_ara(self) -> "Settings":
         # ARA LoRA is a sub-mode of ARA: the module-I/O collection and ARA
