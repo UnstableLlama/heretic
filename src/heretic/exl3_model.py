@@ -329,13 +329,18 @@ class Exl3Model:
             # its fair share so layers spread evenly across all GPUs.
             model_size_gb = _estimate_model_size_gb(self.settings.model)
             if model_size_gb is not None and "use_per_device" in accepted:
-                # Small slack so placement isn't right at the budget edge.
-                per_device = model_size_gb / gpu_count + 0.5
+                # Slack covers the KV/recurrent cache (allocated against the
+                # same budget as weights inside exllamav3's split check) and
+                # a bit of placement headroom. 2 GB/device handles cache for
+                # typical max_num_tokens settings; bump exl3_reserve_per_device
+                # if your model has an oversized cache.
+                slack = 2.0
+                per_device = model_size_gb / gpu_count + slack
                 kwargs["use_per_device"] = [per_device] * gpu_count
                 print(
                     f"* EXL3 auto-balanced split: "
                     f"[bold]{per_device:.2f}[/] GB/device × {gpu_count} "
-                    f"(model ≈ {model_size_gb:.2f} GB)"
+                    f"(model ≈ {model_size_gb:.2f} GB, +{slack:.1f} GB/device for cache)"
                 )
             elif "reserve_per_device" in accepted:
                 # Fallback: model size unknown or use_per_device unsupported.
