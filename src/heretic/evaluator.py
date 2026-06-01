@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import math
+
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -102,6 +104,18 @@ class Evaluator:
             log_target=True,
         ).item()
         print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
+
+        if not math.isfinite(kl_divergence):
+            # Abliteration blew up the forward pass (overflowed fp16 or
+            # produced NaN logits). The model emits garbage, so counting
+            # refusals is wasted time and the result is meaningless. Signal
+            # worst-possible score to Optuna so the trial is dropped from
+            # the Pareto front.
+            print(
+                "  * [yellow]Skipping refusal count[/] "
+                "(KL non-finite — abliteration blew up)"
+            )
+            return (float("inf"), float("inf")), kl_divergence, 0
 
         print("  * Counting model refusals...")
         refusals = self.count_refusals()

@@ -727,9 +727,24 @@ def run():
         # When invert_target is set, the "good" direction for refusals is high
         # (more behavior expression), not low — flip the refusals key so the
         # Pareto sweep keeps the high-refusal trials.
+        # Filter out trials whose forward pass blew up (non-finite KL): they
+        # were short-circuited in get_score(), have meaningless refusal counts,
+        # and would otherwise poison the sort key with NaN.
+        finite_trials = [
+            t
+            for t in completed_trials
+            if math.isfinite(t.user_attrs["kl_divergence"])
+        ]
+        if not finite_trials:
+            raise RuntimeError(
+                "All completed trials had non-finite KL divergence "
+                "(abliteration blew up on every trial). Try a lower "
+                "ara_lora_regularization, a smaller layer range, or different "
+                "weight ranges."
+            )
         refusals_sort_sign = -1 if settings.invert_target else 1
         sorted_trials = sorted(
-            completed_trials,
+            finite_trials,
             key=lambda trial: (
                 refusals_sort_sign * trial.user_attrs["refusals"],
                 trial.user_attrs["kl_divergence"],
@@ -771,6 +786,15 @@ def run():
 
         print()
         print("[bold green]Optimization finished![/]")
+        n_blown_up = len(completed_trials) - len(finite_trials)
+        if n_blown_up > 0:
+            print(
+                f"[yellow]* {n_blown_up}/{len(completed_trials)} trials blew up "
+                f"(non-finite KL) and were excluded from the Pareto front. "
+                f"Try setting [bold]ara_lora_regularization[/] to a small "
+                f"positive value (e.g. 1e-3) to bound the LoRA factors."
+                "[/]"
+            )
         print()
         print(
             (
