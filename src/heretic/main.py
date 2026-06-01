@@ -724,10 +724,14 @@ def run():
         # Get the Pareto front of trials. We can't use study.best_trials directly
         # as get_score() doesn't return the pure KL divergence and refusal count.
         # Note: Unlike study.best_trials, this does not handle objective constraints.
+        # When invert_target is set, the "good" direction for refusals is high
+        # (more behavior expression), not low — flip the refusals key so the
+        # Pareto sweep keeps the high-refusal trials.
+        refusals_sort_sign = -1 if settings.invert_target else 1
         sorted_trials = sorted(
             completed_trials,
             key=lambda trial: (
-                trial.user_attrs["refusals"],
+                refusals_sort_sign * trial.user_attrs["refusals"],
                 trial.user_attrs["kl_divergence"],
             ),
         )
