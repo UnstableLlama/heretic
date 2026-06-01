@@ -85,6 +85,23 @@ _BLOCK_KEY_REGEX = re.compile(
 )
 
 
+def _estimate_model_size_gb(model_path: str) -> float | None:
+    """Sum on-disk size of weight files in the model directory."""
+    if not model_path:
+        return None
+    p = Path(model_path).expanduser()
+    if not p.is_dir():
+        return None
+    total = 0
+    for f in p.iterdir():
+        if f.suffix in (".safetensors", ".bin"):
+            with suppress(OSError):
+                total += f.stat().st_size
+    if total == 0:
+        return None
+    return total / 1024**3
+
+
 class _Exl3Tokenizer:
     """Thin wrapper that gives an exllamav3 Tokenizer the small slice of the
     HF tokenizer surface that Heretic's ``main.py`` calls on
@@ -256,6 +273,12 @@ class Exl3Model:
         * ``reserve_per_device``    — GB to reserve per device; lets exllamav3
                                       auto-split layers across all visible GPUs.
 
+        By default we pick the ``use_per_device`` path and pass an
+        evenly-balanced per-device budget derived from the on-disk weight
+        size. The ``reserve_per_device`` path packs cuda:0 to capacity and
+        leaves the rest idle, which then OOMs at inference time because
+        there's no room left for activations / KV cache / recurrent state.
+
         Note: we deliberately do not expose exllamav3's tensor-parallel mode
         (``tensor_p=True``). TP routes forward passes through ``forward_tp``,
         which bypasses the per-block forward hooks Heretic installs to capture
@@ -297,15 +320,30 @@ class Exl3Model:
                     "[yellow]* WARNING:[/] installed exllamav3 has no "
                     "'use_per_device' parameter; ignoring exl3_gpu_split."
                 )
-        elif gpu_count > 1 and "reserve_per_device" in accepted:
-            # Let exllamav3 spread layers across all visible GPUs. Note that a
-            # model small enough to fit on one GPU may still land entirely on
-            # the first device; use exl3_gpu_split to force a particular split.
-            kwargs["reserve_per_device"] = self.settings.exl3_reserve_per_device
-            print(
-                f"* EXL3 auto-split across [bold]{gpu_count}[/] GPUs "
-                f"(reserving {self.settings.exl3_reserve_per_device} GB/device)"
-            )
+        elif gpu_count > 1:
+            # Auto-balance: exllamav3's reserve_per_device alone packs the
+            # first GPU until full and leaves the rest idle, which then
+            # OOMs at inference time because there's no headroom on cuda:0
+            # for activations / KV cache / recurrent state. Estimate the
+            # model footprint from the weight files and cap each device at
+            # its fair share so layers spread evenly across all GPUs.
+            model_size_gb = _estimate_model_size_gb(self.settings.model)
+            if model_size_gb is not None and "use_per_device" in accepted:
+                # Small slack so placement isn't right at the budget edge.
+                per_device = model_size_gb / gpu_count + 0.5
+                kwargs["use_per_device"] = [per_device] * gpu_count
+                print(
+                    f"* EXL3 auto-balanced split: "
+                    f"[bold]{per_device:.2f}[/] GB/device × {gpu_count} "
+                    f"(model ≈ {model_size_gb:.2f} GB)"
+                )
+            elif "reserve_per_device" in accepted:
+                # Fallback: model size unknown or use_per_device unsupported.
+                kwargs["reserve_per_device"] = self.settings.exl3_reserve_per_device
+                print(
+                    f"* EXL3 auto-split across [bold]{gpu_count}[/] GPUs "
+                    f"(reserving {self.settings.exl3_reserve_per_device} GB/device)"
+                )
 
         # Drop anything the installed version doesn't understand (keep
         # progressbar, which every known version accepts).
