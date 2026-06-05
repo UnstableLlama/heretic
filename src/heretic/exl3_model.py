@@ -59,7 +59,13 @@ from torch.optim import LBFGS
 from .config import RowNormalization, Settings
 from .model import ARAParameters, AbliterationParameters, ModuleIO
 from .system import empty_cache
-from .utils import Prompt, batchify, mean_distances_to_knn, print
+from .utils import (
+    Prompt,
+    balance_lora_factors,
+    batchify,
+    mean_distances_to_knn,
+    print,
+)
 
 
 # Match keys like:
@@ -1069,12 +1075,18 @@ class Exl3Model:
                     # rewards pushing bad outputs arbitrarily far), so LBFGS can
                     # drive ||A@B|| large; combined with LoRA's scale degeneracy
                     # (A@B is invariant under A->cA, B->B/c) the factors can blow
-                    # past fp16 range, giving nan logits at eval. If the update
-                    # isn't finite once cast to the fp16 storage dtype, skip it
-                    # (leave the slot zeroed = no-op for this module) so the
-                    # trial yields a clean finite score instead of poisoning the
-                    # evaluation with nan.
+                    # past fp16 range, giving nan logits at eval.
+                    #
+                    # First rebalance the per-component factor norms: this leaves
+                    # the product (and the KL) unchanged but removes the
+                    # degeneracy that lets one factor sit far outside fp16 range,
+                    # so many updates that would otherwise overflow now fit. If
+                    # the result still isn't finite once cast to the fp16 storage
+                    # dtype, skip it (leave the slot zeroed = no-op for this
+                    # module) so the trial yields a clean finite score instead of
+                    # poisoning the evaluation with nan.
                     with torch.no_grad():
+                        balance_lora_factors(a_param, b_param, a_rank_dim=1, b_rank_dim=0)
                         a_slot.zero_()
                         b_slot.zero_()
                         a16 = a_param.to(torch.float16)
@@ -1086,7 +1098,8 @@ class Exl3Model:
                             print(
                                 "[yellow]WARNING:[/] non-finite ARA-LoRA update on "
                                 f"[bold]{module.key}[/]; skipping this module "
-                                "(check overcorrect_relative_weight)."
+                                "(check overcorrect_relative_weight / "
+                                "ara_lora_regularization)."
                             )
 
     # ------------------------------------------------------------------
@@ -1414,10 +1427,14 @@ class Exl3Model:
                     adapter_state[f"{base_key}.lora_A.weight"] = a_peft
                     adapter_state[f"{base_key}.lora_B.weight"] = b_peft
 
+        # Match the live slot rank (1 for directional ablation, ara_lora_rank
+        # when --use-ara-lora is active) and set lora_alpha == r so PEFT's
+        # alpha/r scaling reproduces the exllamav3 forward's implicit 1.0.
+        rank = self._lora_rank()
         peft_config = LoraConfig(
             task_type="CAUSAL_LM",
-            r=1,
-            lora_alpha=1,
+            r=rank,
+            lora_alpha=rank,
             lora_dropout=0.0,
             bias="none",
             target_modules=sorted(target_module_names),
@@ -1517,7 +1534,11 @@ class Exl3Model:
         multimodal = self._is_multimodal()
         hf_base = self._hf_base_model_name()
 
-        rank = 1  # We only allocate rank-1 slots in this backend.
+        # Slot rank matches the abliteration mode: 1 for directional ablation,
+        # ara_lora_rank (default 128) when --use-ara-lora is active. The
+        # exllamav3 forward applies x @ A @ B with no scaling, so set
+        # lora_alpha == r to make PEFT's alpha/r scaling 1.0 on reload.
+        rank = self._lora_rank()
         adapter_config = {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
