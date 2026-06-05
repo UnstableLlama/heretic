@@ -34,7 +34,13 @@ from transformers.generation import (
 
 from .config import QuantizationMethod, RowNormalization, Settings
 from .system import empty_cache
-from .utils import Prompt, batchify, mean_distances_to_knn, print
+from .utils import (
+    Prompt,
+    balance_lora_factors,
+    batchify,
+    mean_distances_to_knn,
+    print,
+)
 
 
 def get_model_class(
@@ -741,6 +747,35 @@ class Model:
                     bad_input = bad_input.float().to(lora_A.device)
                     bad_output = bad_output.float().to(lora_A.device)
 
+                    # Optimise fresh fp32 scratch factors rather than the live
+                    # adapter weights, then write the result back (mirrors the
+                    # EXL3 backend). Two reasons:
+                    #   1. Independence: reset_model() only zeros lora_B between
+                    #      trials, so the live lora_A would otherwise carry over
+                    #      the previous trial's converged (or blown-up) values.
+                    #      If a trial drives lora_A non-finite, the next trial's
+                    #      W_base + (0 @ A) hits 0*inf = NaN and every subsequent
+                    #      trial cascades to NaN. Fresh factors make trials
+                    #      independent and break the cascade.
+                    #   2. Stability: optimising in fp32 (the adapter weights may
+                    #      be fp16/bf16) avoids precision loss inside LBFGS, which
+                    #      matters most on aggressive quants where the factors run
+                    #      large. Mirror PEFT's init: A nonzero (kaiming), B zero,
+                    #      so the initial A@B is zero (no perturbation) while
+                    #      gradients can still flow into B.
+                    device = lora_A.device
+                    a_param = torch.empty(
+                        lora_A.shape, dtype=torch.float32, device=device
+                    )
+                    torch.nn.init.kaiming_uniform_(a_param, a=math.sqrt(5))
+                    a_param = a_param.detach().requires_grad_(True)
+                    b_param = torch.zeros(
+                        lora_B.shape,
+                        dtype=torch.float32,
+                        device=device,
+                        requires_grad=True,
+                    )
+
                     def objective(A: Tensor, B: Tensor) -> Tensor:
                         W_eff = W_base + (B @ A)
 
@@ -785,7 +820,7 @@ class Model:
                         return loss
 
                     optimizer = LBFGS(
-                        [lora_A, lora_B],
+                        [a_param, b_param],
                         lr=1.0,
                         max_iter=20,
                         history_size=10,
@@ -794,12 +829,43 @@ class Model:
 
                     def closure():
                         optimizer.zero_grad()
-                        loss = objective(lora_A, lora_B)
+                        loss = objective(a_param, b_param)
                         loss.backward()
                         return loss
 
                     for step in range(5):
                         optimizer.step(closure)
+
+                    # Write the optimised factors back into the live adapter,
+                    # but only if finite. The overcorrection objective is
+                    # unbounded below and LoRA has an A@B scale degeneracy, so
+                    # LBFGS can drive the factors past the adapter's storage
+                    # dtype range, yielding nan logits / nan KL at eval (a wasted
+                    # trial).
+                    #
+                    # First rebalance the per-component factor norms: this leaves
+                    # the product (and the KL) unchanged but removes the
+                    # degeneracy that lets one factor sit far outside range. If
+                    # the cast still isn't finite, leave the adapter zeroed
+                    # (no-op for this module) so the trial scores cleanly instead
+                    # of poisoning the evaluation -- and so the non-finite values
+                    # never persist into the next trial.
+                    with torch.no_grad():
+                        balance_lora_factors(a_param, b_param, a_rank_dim=0, b_rank_dim=1)
+                        a16 = a_param.to(lora_A.dtype)
+                        b16 = b_param.to(lora_B.dtype)
+                        if torch.isfinite(a16).all() and torch.isfinite(b16).all():
+                            lora_A.copy_(a16)
+                            lora_B.copy_(b16)
+                        else:
+                            lora_A.zero_()
+                            lora_B.zero_()
+                            print(
+                                "[yellow]WARNING:[/] non-finite ARA-LoRA update on "
+                                f"layer [bold]{layer_index}[/] {component}; "
+                                "skipping this module (check "
+                                "overcorrect_relative_weight / ara_lora_regularization)."
+                            )
 
     def get_module_io(
         self,
