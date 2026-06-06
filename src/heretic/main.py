@@ -520,8 +520,8 @@ def run():
             )
             steer_bad_behavior_weight = trial.suggest_float(
                 "steer_bad_behavior_weight",
-                0.0001,
-                1.0,
+                settings.steer_bad_behavior_weight_min,
+                settings.steer_bad_behavior_weight_max,
                 log=True,
             )
             overcorrect_relative_weight = trial.suggest_float(
