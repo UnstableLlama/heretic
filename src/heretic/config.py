@@ -368,6 +368,38 @@ class Settings(BaseSettings):
         ),
     )
 
+    steer_bad_behavior_weight_min: float = Field(
+        default=0.0001,
+        description=(
+            "Lower bound of the search range for the ARA inner-objective "
+            "'steer_bad_behavior_weight', which the outer optimizer samples on a "
+            "log scale. Applies to both ARA and ARA-LoRA. Must be positive and "
+            "no greater than steer_bad_behavior_weight_max."
+        ),
+    )
+
+    steer_bad_behavior_weight_max: float = Field(
+        default=1.0,
+        description=(
+            "Upper bound of the search range for the ARA inner-objective "
+            "'steer_bad_behavior_weight', which the outer optimizer samples on a "
+            "log scale. Applies to both ARA and ARA-LoRA. Lower this (e.g. to "
+            "0.001) to clamp the explored phase space when large values are known "
+            "to produce poor abliterations."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_steer_bad_behavior_weight_range(self) -> "Settings":
+        if self.steer_bad_behavior_weight_min <= 0:
+            raise ValueError("steer_bad_behavior_weight_min must be positive.")
+        if self.steer_bad_behavior_weight_max < self.steer_bad_behavior_weight_min:
+            raise ValueError(
+                "steer_bad_behavior_weight_max must be >= "
+                "steer_bad_behavior_weight_min."
+            )
+        return self
+
     invert_target: bool = Field(
         default=False,
         description=(
