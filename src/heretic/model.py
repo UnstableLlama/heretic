@@ -20,12 +20,14 @@ from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     BatchEncoding,
     BitsAndBytesConfig,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    ProcessorMixin,
     TextStreamer,
 )
 from transformers.generation import (
@@ -109,6 +111,8 @@ def _temporarily_hide_local_adapter_files(model_path: str):
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
+    # Set for multimodal models, None for text-only ones.
+    processor: ProcessorMixin | None
     peft_config: LoraConfig
 
     def __init__(self, settings: Settings):
@@ -127,6 +131,15 @@ class Model:
             trust_remote_code=settings.trust_remote_code,
             **self.revision_kwargs,
         )
+
+        # Multimodal models have a processor we'll want to save.
+        self.processor = None
+        if get_model_class(settings.model) == AutoModelForImageTextToText:
+            self.processor = AutoProcessor.from_pretrained(
+                settings.model,
+                trust_remote_code=settings.trust_remote_code,
+                **self.revision_kwargs,
+            )
 
         # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
@@ -451,6 +464,21 @@ class Model:
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
             for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
+                try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
+
+        # LFM dense operator blocks.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.conv.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.feed_forward.w2)  # ty:ignore[possibly-missing-attribute]
+
+        # LFM transformer blocks.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        with suppress(Exception):
+            for expert in layer.feed_forward.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
 
         # Granite MoE Hybrid - attention layers with shared_mlp.
@@ -1140,7 +1168,7 @@ class Model:
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
-            output_scores=True,
+            output_logits=True,
             return_dict_in_generate=True,
             use_cache=False,
         )
@@ -1149,9 +1177,9 @@ class Model:
         # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
 
-        # Logits for the first (only) generated token.
-        # This cast is valid because we passed output_scores=True above.
-        logits = cast(tuple[FloatTensor], outputs.scores)[0]
+        # Use raw logits, not processed generation scores; processors can insert
+        # -inf for suppressed tokens, which can make KL divergence evaluate to NaN.
+        logits = cast(tuple[FloatTensor], outputs.logits)[0]
 
         # The returned tensor has shape (prompt, token).
         logprobs = F.log_softmax(logits, dim=-1)
