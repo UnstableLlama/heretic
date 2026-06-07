@@ -130,11 +130,12 @@ ara_lora_rank = 128
 
 # Search range for the ARA inner-objective "steer_bad_behavior_weight", which the
 # outer optimizer samples on a log scale. Applies to both ARA and ARA-LoRA.
-# Lower the max (e.g. to 0.001) to clamp the explored phase space when large
-# values are known to produce poor abliterations. min must be positive and no
-# greater than max.
+# The max defaults to 0.001: the optimizer reliably prefers the low end, and
+# large values are the dominant source of non-finite-KL ("blown up") trials on
+# low-bpw EXL3 ARA-LoRA. Raise the max (e.g. to 1.0) to explore a wider phase
+# space. min must be positive and no greater than max.
 steer_bad_behavior_weight_min = 0.0001
-steer_bad_behavior_weight_max = 1.0
+steer_bad_behavior_weight_max = 0.001
 
 # Invert the steering target: push "bad" outputs further from "good" and deeper
 # into the "bad" cluster (amplifying the targeted behavior) instead of the

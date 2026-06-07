@@ -385,13 +385,14 @@ class Settings(BaseSettings):
     )
 
     steer_bad_behavior_weight_max: float = Field(
-        default=1.0,
+        default=0.001,
         description=(
             "Upper bound of the search range for the ARA inner-objective "
             "'steer_bad_behavior_weight', which the outer optimizer samples on a "
-            "log scale. Applies to both ARA and ARA-LoRA. Lower this (e.g. to "
-            "0.001) to clamp the explored phase space when large values are known "
-            "to produce poor abliterations."
+            "log scale. Applies to both ARA and ARA-LoRA. Defaults to 0.001: the "
+            "optimizer reliably prefers the low end, and large values are the "
+            "dominant source of non-finite-KL ('blown up') trials on low-bpw EXL3 "
+            "ARA-LoRA. Raise it (e.g. to 1.0) to explore a wider phase space."
         ),
     )
 

@@ -59,13 +59,7 @@ from torch.optim import LBFGS
 from .config import RowNormalization, Settings
 from .model import ARAParameters, AbliterationParameters, ModuleIO
 from .system import empty_cache
-from .utils import (
-    Prompt,
-    balance_lora_factors,
-    batchify,
-    mean_distances_to_knn,
-    print,
-)
+from .utils import Prompt, batchify, mean_distances_to_knn, print
 
 
 # Match keys like:
@@ -1075,18 +1069,12 @@ class Exl3Model:
                     # rewards pushing bad outputs arbitrarily far), so LBFGS can
                     # drive ||A@B|| large; combined with LoRA's scale degeneracy
                     # (A@B is invariant under A->cA, B->B/c) the factors can blow
-                    # past fp16 range, giving nan logits at eval.
-                    #
-                    # First rebalance the per-component factor norms: this leaves
-                    # the product (and the KL) unchanged but removes the
-                    # degeneracy that lets one factor sit far outside fp16 range,
-                    # so many updates that would otherwise overflow now fit. If
-                    # the result still isn't finite once cast to the fp16 storage
-                    # dtype, skip it (leave the slot zeroed = no-op for this
-                    # module) so the trial yields a clean finite score instead of
-                    # poisoning the evaluation with nan.
+                    # past fp16 range, giving nan logits at eval. If the update
+                    # isn't finite once cast to the fp16 storage dtype, skip it
+                    # (leave the slot zeroed = no-op for this module) so the
+                    # trial yields a clean finite score instead of poisoning the
+                    # evaluation with nan.
                     with torch.no_grad():
-                        balance_lora_factors(a_param, b_param, a_rank_dim=1, b_rank_dim=0)
                         a_slot.zero_()
                         b_slot.zero_()
                         a16 = a_param.to(torch.float16)
@@ -1098,8 +1086,7 @@ class Exl3Model:
                             print(
                                 "[yellow]WARNING:[/] non-finite ARA-LoRA update on "
                                 f"[bold]{module.key}[/]; skipping this module "
-                                "(check overcorrect_relative_weight / "
-                                "ara_lora_regularization)."
+                                "(check overcorrect_relative_weight)."
                             )
 
     # ------------------------------------------------------------------

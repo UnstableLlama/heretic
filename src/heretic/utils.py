@@ -296,43 +296,6 @@ def mean_distances_to_knn(
     return topk.values.mean(dim=1)
 
 
-def balance_lora_factors(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    a_rank_dim: int,
-    b_rank_dim: int,
-) -> None:
-    """Rescale paired rank components of ``A`` and ``B`` in place to equal norm,
-    without changing the product ``A @ B`` (the abliteration update).
-
-    LoRA has a per-component scale degeneracy: scaling rank component ``k`` of
-    ``A`` by ``s`` and the matching component of ``B`` by ``1/s`` leaves the
-    product unchanged. LBFGS exploits this flat direction and can park one
-    factor far outside the storage/compute dtype range (notably fp16, max
-    ~65504), producing nan logits at eval — the dominant source of non-finite
-    KL on aggressive quantizations. Balancing the per-component norms keeps the
-    update (and therefore the KL) identical while pulling both factors back into
-    range.
-
-    ``a_rank_dim`` / ``b_rank_dim`` identify the shared rank axis in each 2-D
-    factor (the other axis is the feature axis). For the EXL3 convention
-    ``A`` is ``(in, rank)`` and ``B`` is ``(rank, out)`` → dims ``1, 0``; for the
-    HF/PEFT convention ``A`` (``lora_A``) is ``(rank, in)`` and ``B``
-    (``lora_B``) is ``(out, rank)`` → dims ``0, 1``.
-    """
-    a_feat_dim = 1 - a_rank_dim
-    b_feat_dim = 1 - b_rank_dim
-    a_norms = A.norm(dim=a_feat_dim)  # (rank,)
-    b_norms = B.norm(dim=b_feat_dim)  # (rank,)
-    # Only rebalance components where both factors contribute; a component that
-    # is zero on either side contributes nothing to the product, so leave it be.
-    both = (a_norms > 0) & (b_norms > 0)
-    s = torch.ones_like(a_norms)
-    s[both] = torch.sqrt(b_norms[both] / a_norms[both])
-    A.mul_(s.unsqueeze(a_feat_dim))
-    B.mul_((1.0 / s).unsqueeze(b_feat_dim))
-
-
 def get_trial_parameters(trial: Trial) -> dict[str, str]:
     params = {}
 
