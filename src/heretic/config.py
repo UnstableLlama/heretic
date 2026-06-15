@@ -434,6 +434,25 @@ class Settings(BaseSettings):
             self.use_ara = True
         return self
 
+    @model_validator(mode="after")
+    def _exl3_ara_requires_lora(self) -> "Settings":
+        # Plain ARA edits each weight matrix in place. EXL3 weights are stored
+        # as quantized trellis blobs that can't be modified in place, so the
+        # EXL3 backend only implements the LoRA variant (ara_lora_abliterate).
+        # Without this guard, --quantization exl3 --use-ara would load the
+        # model and capture module I/O before crashing on the first trial with
+        # an AttributeError. Fail fast instead.
+        if (
+            self.quantization == QuantizationMethod.EXL3
+            and self.use_ara
+            and not self.use_ara_lora
+        ):
+            raise ValueError(
+                "The EXL3 backend cannot run plain ARA (it can't edit quantized "
+                "weights in place). Add --use-ara-lora to use the LoRA variant."
+            )
+        return self
+
     orthogonalize_direction: bool = Field(
         default=True,
         description=(

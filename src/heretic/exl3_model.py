@@ -183,6 +183,11 @@ class Exl3Model:
         """
         self.settings = settings
         self.needs_reload = False
+        # Multimodal processor (vision preprocessing). Mirrors model.Model's
+        # `processor` attribute, which main.py reads on the merged-model
+        # save/upload path. Populated lazily in get_merged_model when the
+        # model is multimodal; None for text-only models.
+        self.processor: Any = None
         self.revision_kwargs: dict[str, Any] = {}
         self.trusted_models: dict[str, bool | None] = {settings.model: False}
         self._inspect_only = inspect_only
@@ -1379,12 +1384,17 @@ class Exl3Model:
         attaches the adapter with PEFT, and returns ``merge_and_unload()``.
         """
         import torch
-        from peft import LoraConfig, get_peft_model
-        from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+        from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
+        from transformers import (
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoProcessor,
+        )
 
         hf_base = self.settings.exl3_base_model or self._hf_base_model_name()
+        multimodal = self._is_multimodal()
         model_class = (
-            AutoModelForImageTextToText if self._is_multimodal() else AutoModelForCausalLM
+            AutoModelForImageTextToText if multimodal else AutoModelForCausalLM
         )
 
         print("* Loading base model on CPU (this may take a while)...")
@@ -1394,6 +1404,16 @@ class Exl3Model:
             device_map="cpu",
             trust_remote_code=bool(self.settings.trust_remote_code),
         )
+
+        # Load the processor for multimodal models so the merged-model save/
+        # upload path in main.py can write the vision preprocessing files
+        # (preprocessor_config.json etc.) alongside the merged weights.
+        if multimodal and self.processor is None:
+            with suppress(Exception):
+                self.processor = AutoProcessor.from_pretrained(
+                    hf_base,
+                    trust_remote_code=bool(self.settings.trust_remote_code),
+                )
 
         target_module_names: set[str] = set()
         adapter_state: dict[str, Tensor] = {}
@@ -1430,21 +1450,52 @@ class Exl3Model:
 
         print("* Applying LoRA adapters...")
         peft_model = get_peft_model(base_model, peft_config)
-        for name, param in peft_model.named_parameters():
-            if name in adapter_state:
-                param.data = adapter_state[name].to(param.device)
+        # Load via PEFT's own state-dict loader rather than matching parameter
+        # names by hand: PEFT stores LoRA factors in adapter-named ModuleDicts,
+        # so the live parameter names carry a ".default" segment
+        # (...lora_A.default.weight) that the exported keys
+        # (...lora_A.weight) don't have. A manual `name in adapter_state`
+        # loop therefore matches nothing and silently merges an unmodified
+        # base model. set_peft_model_state_dict maps the export-format keys
+        # onto the active adapter correctly.
+        load_result = set_peft_model_state_dict(peft_model, adapter_state)
+        unexpected = getattr(load_result, "unexpected_keys", None)
+        if unexpected:
+            print(
+                f"[yellow]* WARNING:[/] {len(unexpected)} adapter tensor(s) did "
+                "not map onto the base model and were dropped during merge "
+                f"(e.g. {unexpected[0]})."
+            )
 
         print("* Merging LoRA adapters into base model...")
         return peft_model.merge_and_unload()
 
     def _is_multimodal(self) -> bool:
-        """Check whether the model uses a multimodal wrapper (i.e. module
-        keys contain a ``language_model`` segment). Multimodal models must
-        be loaded with ``AutoModelForImageTextToText`` when merging the
-        adapter back into HF weights.
+        """Check whether the model is multimodal, and so must be merged with
+        ``AutoModelForImageTextToText`` rather than ``AutoModelForCausalLM``.
+
+        The authoritative signal is a ``vision_config`` in the base model's
+        HF config — the same check ``model.get_model_class`` uses. We fall
+        back to a module-key heuristic when the config can't be read.
+
+        The key heuristic treats ``language_model`` as a path *segment* so it
+        matches both layouts the discovery regex accepts:
+        ``model.language_model.layers.*`` (contains ``.language_model.``) and
+        ``language_model.model.layers.*`` (no leading dot). The previous
+        ``".language_model." in key`` substring test missed the latter,
+        misclassified such models as text-only, and dropped the vision config
+        on merge.
         """
+        with suppress(Exception):
+            from transformers import PretrainedConfig
+
+            hf_base = self.settings.exl3_base_model or self._hf_base_model_name()
+            configs = PretrainedConfig.get_config_dict(hf_base)
+            if any("vision_config" in config for config in configs):
+                return True
+
         return any(
-            ".language_model." in key for key in self._all_module_keys
+            "language_model" in key.split(".") for key in self._all_module_keys
         )
 
     def get_base_model_hint(self) -> str:
@@ -1575,8 +1626,9 @@ class Exl3Model:
             "from pathlib import Path\n"
             "\n"
             "import torch\n"
-            f"from transformers import {model_class}, AutoTokenizer\n"
-            "from peft import PeftModel\n"
+            f"from transformers import {model_class}, AutoTokenizer"
+            + (", AutoProcessor\n" if multimodal else "\n")
+            + "from peft import PeftModel\n"
             "\n"
             "\n"
             "def main():\n"
@@ -1597,7 +1649,13 @@ class Exl3Model:
             "\n"
             "    merged.save_pretrained(args.output, safe_serialization=True)\n"
             "    AutoTokenizer.from_pretrained(args.base).save_pretrained(args.output)\n"
-            '    print(f"Saved merged model to {args.output}")\n'
+            + (
+                "    AutoProcessor.from_pretrained(args.base)"
+                ".save_pretrained(args.output)\n"
+                if multimodal
+                else ""
+            )
+            + '    print(f"Saved merged model to {args.output}")\n'
             "\n"
             "\n"
             'if __name__ == "__main__":\n'
