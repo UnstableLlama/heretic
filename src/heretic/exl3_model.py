@@ -45,6 +45,8 @@ import json
 import math
 import re
 import shutil
+
+import psutil
 from contextlib import suppress
 from pathlib import Path
 from types import ModuleType
@@ -76,6 +78,39 @@ from .utils import Prompt, batchify, mean_distances_to_knn, print
 _MODULE_KEY_REGEX = re.compile(
     r"^(?:model(?:\.language_model)?|language_model\.model)\.layers\.(\d+)\..*?\.(o_proj|out_proj|down_proj)(?:\.slice\.\d+)?$"
 )
+
+# Cap on captured activation rows per *routed-expert* module during ARA-LoRA
+# module-I/O capture. Dense modules (attn.o_proj) are uncapped -- they see one
+# row per prompt, which is cheap. But a many-expert MoE has ~12k routed-expert
+# down_projs, and each expert can be routed thousands of token-rows across the
+# prompt set; holding all of them balloons system RAM (a 256-expert model
+# overran 62 GB + swap). We keep a bounded reservoir per expert instead: enough
+# rows for the ARA k-NN objective (neighbor_count maxes at 15), far below what
+# would exhaust RAM. Stored fp16, so ~12k experts x 64 rows x 4k features x 2 B
+# ~= 6-7 GB/side.
+_ARA_MOE_MAX_SAMPLES = 64
+
+# Minimum captured samples (per side) for a module to be worth optimising. A
+# routed expert that fires on very few / no bad prompts has nothing to abliterate
+# and would give the k-NN objective a degenerate fit; skip it (slot stays zero).
+_ARA_MIN_SAMPLES = 2
+
+# Abort the capture pass if system memory use crosses this percentage. Insurance
+# against a future capture bug re-triggering the creep-of-death; with the
+# bounded reservoir above, normal runs stay far below it.
+_RAM_GUARD_PERCENT = 90.0
+
+
+def _check_ram_guard() -> None:
+    vm = psutil.virtual_memory()
+    if vm.percent >= _RAM_GUARD_PERCENT:
+        raise RuntimeError(
+            f"Aborting ARA module-I/O capture: system RAM at {vm.percent:.0f}% "
+            f"(>= {_RAM_GUARD_PERCENT:.0f}% guard, "
+            f"{vm.available / 1e9:.1f} GB free). This should not happen with the "
+            "bounded per-expert reservoir; if it does, lower batch_size or the "
+            "good/bad prompt counts, or file a capture-memory bug."
+        )
 
 # Block-level keys, used to find decoder layers without depending on
 # isinstance(TransformerBlock) (some architectures use custom block
@@ -858,92 +893,87 @@ class Exl3Model:
             )
         return W[:in_u, :out_u].to(torch.float32)
 
-    def get_module_io(
-        self,
-        prompts: list[Prompt],
-    ) -> ModuleIO:
-        module_io: ModuleIO = []
-
-        # Build a mapping from module id to (layer_index, component, module_index)
-        # and wrap each target module's forward to capture I/O.
-        originals: list[tuple[Any, Any]] = []  # (module, original_forward)
-
-        for layer_index in range(len(self._layer_modules)):
-            for component, modules in self._layer_modules[layer_index].items():
-                for module_index, module in enumerate(modules):
-                    orig = module.forward
-
-                    def _make_wrapper(
-                        orig_fn: Any,
-                        li: int,
-                        comp: str,
-                        mi: int,
-                    ) -> Any:
-                        def wrapped(x, params, out_dtype=None):
-                            out = orig_fn(x, params, out_dtype=out_dtype)
-                            while len(module_io) <= li:
-                                module_io.append({})
-                            if comp not in module_io[li]:
-                                module_io[li][comp] = {}
-                            # x shape: (B, T, in_features). Capture last position.
-                            inp = x[:, -1, :].detach().clone().cpu()
-                            outp = out[:, -1, :].detach().clone().cpu()
-                            module_io[li][comp][mi] = (inp, outp)
-                            return out
-
-                        return wrapped
-
-                    module.forward = _make_wrapper(orig, layer_index, component, module_index)
-                    originals.append((module, orig))
-
-        # Run a single forward pass to capture I/O.
-        input_ids = self._tokenize_chat(prompts)
-        with torch.inference_mode():
-            self.model.forward(input_ids, params={})
-
-        # Restore original forwards.
-        for module, orig in originals:
-            module.forward = orig
-
-        return module_io
-
     def get_module_io_batched(
         self,
         prompts: list[Prompt],
     ) -> ModuleIO:
-        module_io_batches: list[ModuleIO] = [
-            self.get_module_io(batch)
-            for batch in batchify(prompts, self.settings.batch_size)
-        ]
+        """Capture per-module (input, output) activations for ARA-LoRA.
 
-        module_io: ModuleIO = []
-        for layer_index in range(len(self._layer_modules)):
-            module_io.append({})
-            for module_io_batch in module_io_batches:
-                if layer_index >= len(module_io_batch):
-                    continue
-                for component, io_map in module_io_batch[layer_index].items():
-                    if component not in module_io[layer_index]:
-                        module_io[layer_index][component] = {}
-                    for module_index in io_map:
-                        if module_index not in module_io[layer_index][component]:
-                            module_io[layer_index][component][module_index] = (
-                                torch.empty(0),
-                                torch.empty(0),
-                            )
+        Uses a bounded per-module reservoir accumulated across batches, rather
+        than holding every batch's full capture in RAM and concatenating at the
+        end. This is what makes many-expert MoE tractable: a 256-expert model
+        has ~12k routed-expert down_projs, and the naive hold-everything
+        approach exhausts system RAM (62 GB + swap) during capture.
 
-            for component, io_map in module_io[layer_index].items():
-                for module_index in io_map:
-                    inputs_outputs = [
-                        module_io_batch[layer_index][component][module_index]
-                        for module_io_batch in module_io_batches
-                        if layer_index < len(module_io_batch)
-                        and component in module_io_batch[layer_index]
-                        and module_index in module_io_batch[layer_index][component]
-                    ]
-                    inp = torch.cat([io[0] for io in inputs_outputs], dim=0)
-                    outp = torch.cat([io[1] for io in inputs_outputs], dim=0)
-                    module_io[layer_index][component][module_index] = (inp, outp)
+        Capture semantics per module:
+        * Dense modules (attn.o_proj): (B, T, features) -> keep the last token
+          of each sequence (the ARA convention), one row per prompt. Uncapped;
+          cheap.
+        * Routed MoE experts (mlp.down_proj): (routed_tokens, features), no
+          sequence dim (tokens are gathered per-expert). Keep up to
+          ``_ARA_MOE_MAX_SAMPLES`` rows total across all batches, then stop
+          copying that expert. Experts that are never routed simply never
+          appear -- ara_lora_abliterate skips them (leaving their slot zero).
+
+        Activations are stored fp16 on CPU; the optimiser upcasts to fp32.
+        """
+        # reservoir[li][comp][mi] = list of cpu fp16 chunks (each (rows, feat)).
+        in_chunks: dict[tuple[int, str, int], list[Tensor]] = {}
+        out_chunks: dict[tuple[int, str, int], list[Tensor]] = {}
+        rows: dict[tuple[int, str, int], int] = {}
+
+        def _make_wrapper(orig_fn: Any, key: tuple[int, str, int]) -> Any:
+            def wrapped(x, params, out_dtype=None):
+                out = orig_fn(x, params, out_dtype=out_dtype)
+                if x.dim() >= 3:
+                    # Dense: last token per sequence, one row per prompt.
+                    inp = x[:, -1, :]
+                    outp = out[:, -1, :]
+                else:
+                    # Routed expert: bounded reservoir over routed-token rows.
+                    have = rows.get(key, 0)
+                    remaining = _ARA_MOE_MAX_SAMPLES - have
+                    if remaining <= 0:
+                        return out
+                    inp = x[:remaining]
+                    outp = out[:remaining]
+                in_chunks.setdefault(key, []).append(
+                    inp.detach().to(torch.float16).cpu()
+                )
+                out_chunks.setdefault(key, []).append(
+                    outp.detach().to(torch.float16).cpu()
+                )
+                rows[key] = rows.get(key, 0) + inp.shape[0]
+                return out
+
+            return wrapped
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            _check_ram_guard()
+            originals: list[tuple[Any, Any]] = []  # (module, original_forward)
+            for layer_index in range(len(self._layer_modules)):
+                for component, modules in self._layer_modules[layer_index].items():
+                    for module_index, module in enumerate(modules):
+                        orig = module.forward
+                        module.forward = _make_wrapper(
+                            orig, (layer_index, component, module_index)
+                        )
+                        originals.append((module, orig))
+
+            input_ids = self._tokenize_chat(batch)
+            with torch.inference_mode():
+                self.model.forward(input_ids, params={})
+
+            for module, orig in originals:
+                module.forward = orig
+
+        # Finalise: concatenate each module's chunk list into one tensor.
+        module_io: ModuleIO = [{} for _ in range(len(self._layer_modules))]
+        for key in in_chunks:
+            li, comp, mi = key
+            inp = torch.cat(in_chunks[key], dim=0)
+            outp = torch.cat(out_chunks[key], dim=0)
+            module_io[li].setdefault(comp, {})[mi] = (inp, outp)
 
         return module_io
 
@@ -976,6 +1006,25 @@ class Exl3Model:
                     a_slot = module.lora_a_tensors[self._lora_key]
                     b_slot = module.lora_b_tensors[self._lora_key]
 
+                    # Skip modules with too few captured samples (thinly-routed
+                    # or never-routed experts). reset_model already zeroed the
+                    # slot, so a skip leaves this expert un-abliterated -- correct,
+                    # since an expert that barely fires on bad prompts isn't
+                    # carrying the behavior being removed.
+                    good_io = good_module_io[layer_index].get(component, {}).get(
+                        module_index
+                    )
+                    bad_io = bad_module_io[layer_index].get(component, {}).get(
+                        module_index
+                    )
+                    if (
+                        good_io is None
+                        or bad_io is None
+                        or good_io[0].shape[0] < _ARA_MIN_SAMPLES
+                        or bad_io[0].shape[0] < _ARA_MIN_SAMPLES
+                    ):
+                        continue
+
                     # Create fp32 optimizer parameters. Mirror PEFT's LoRA
                     # init: A nonzero (kaiming), B zero. The update is the
                     # bilinear product A@B, whose gradient is zero in *both*
@@ -996,8 +1045,8 @@ class Exl3Model:
                         requires_grad=True,
                     )
 
-                    good_input, good_output = good_module_io[layer_index][component][module_index]
-                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
+                    good_input, good_output = good_io
+                    bad_input, bad_output = bad_io
 
                     good_input = good_input.float().to(device)
                     good_output = good_output.float().to(device)
