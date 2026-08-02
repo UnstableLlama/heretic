@@ -1,0 +1,104 @@
+
+
+PYTHONPATH=src python scripts/inspect_exl3_modules.py /mnt/two/Weights/Qwen_Qwen3.5-2B/ --out artifacts/exl3_module_map.json
+
+PYTHONPATH=src python scripts/smoke_test_exl3_lora.py /mnt/two/Weights/Qwen_Qwen3.5-2B/ --adapter-path <adapter_path> --strict --out artifacts/exl3_smoke.json
+
+Inspect failure_category and delta fields to determine pass/fail gate.
+
+pip install -U 'heretic-llm[exl3]'
+PYTHONPATH=src python scripts/inspect_exl3_modules.py /mnt/two/Weights/Qwen_Qwen3.5-2B/4 --out artifacts/modules.json
+PYTHONPATH=src python scripts/smoke_test_exl3_lora.py /mnt/two/Weights/Qwen_Qwen3.5-2B/4 --strict --out artifacts/smoke.json
+
+
+heretic --n-trials 50 --row-normalization none --use-ara-lora /mnt/two/Weights/TheDrummer_Rocinante-XL-16B-v1/ 
+heretic --n-trials 50 --row-normalization none --max-batch-size 16 --exl3-max-tokens 2048 --quantization exl3 /mnt/two/Weights/mistralai_Mistral-Medium-3.5-128B-text/2.25bpw/
+heretic --n-trials 50 --row-normalization full /mnt/two/Weights/ibm-granite-granite-4.1-8b/
+/mnt/two/Weights/allenai-Olmo-3-7B-Instruct/
+heretic --n-trials 50 --row-normalization none --max-batch-size 8 --use-ara-lora --exl3-max-num-tokens 2048 --quantization exl3 /mnt/two/Weights/mistralai_Mistral-Medium-3.5-128B-text/2.50bpw/
+
+heretic --n-trials 50 --row-normalization none --batch-size 64 --use-ara-lora /mnt/two/Weights/meta-llama-Llama-3.2-3B-Instruct/
+
+heretic --n-trials 100 --row-normalization none --use-ara-lora --invert-target --max-batch-size 64 /mnt/two/Weights/TheDrummer_Rocinante-XL-16B-v1/
+
+heretic --n-trials 50 --row-normalization none --plot-residuals --print-residual-geometry --batch-size 64 /mnt/two/Weights/TheDrummer_Rocinante-XL-16B-v1/
+
+
+heretic --n-trials 100 --row-normalization none --batch-size 8 --quantization exl3 --use-ara-lora /mnt/two/Weights/mistralai_Mistral-Medium-3.5-128B-text/2.50/
+
+/mnt/two/Weights/meta-llama-Llama-3.2-3B-Instruct/
+
+/mnt/two/Weights/Qwen_Qwen3.6-27B/2.5/
+
+heretic --batch-size 64 --n-trials 50 --row-normalization none --use-ara-lora /mnt/two/Weights/meta-llama-Llama-3.2-3B-Instruct/
+
+
+--quantization BNB_4BIT
+/mnt/two/Weights/dr-house_mdzerofata-gemma4-G4-MeroMero-26B-A4B-4.45bpw-exl3/
+
+/mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/
+
+git pull
+pip install -e .
+
+/mnt/two/Weights/Qwen_Qwen3.5-27B/
+
+python examples/chat.py -m /mnt/two/Weights/Qwen_Qwen3.5-27B/2.1/ -mode qwen35
+
+python examples/chat.py -m /mnt/two/Weights/Qwen_Qwen3.5-2B/4 -mode qwen35
+
+# Wealth of options
+python examples/chat.py -h
+
+python -c "import pandas as pd; df = pd.read_parquet('train-00000-of-00001.parquet'); df.to_json('train.jsonl', orient='records', lines=True)"
+
+python -c "from datasets import load_dataset; ds = load_dataset('json', data_files='loving.jsonl'); ds['train'].to_parquet('train.parquet')"
+python -c "
+from datasets import load_dataset
+ds = load_dataset('json', data_files='/home/unstable/datasets/loving/data/loving.jsonl')['train']
+split = ds.train_test_split(test_size=0.25, shuffle=True, seed=42)
+split.save_to_disk('/home/unstable/datasets/loving')
+
+python - <<'PY'
+from datasets import load_dataset
+
+inp = "/home/unstable/datasets/loving/data/loving.jsonl"
+out = "/home/unstable/datasets/loving"
+
+ds = load_dataset("json", data_files=inp)["train"]
+
+split = ds.train_test_split(
+    test_size=0.2,
+    shuffle=True,
+    seed=42
+)
+
+split.save_to_disk(out)
+
+print(split)
+PY
+"
+mkdir -p conscious/data
+
+heretic --markers funny --n-trials 50 --invert b --datasets --row-normalization none /mnt/two/Weights/meta-llama-Llama-3.2-3B-Instruct/
+
+
+python -c "from datasets import load_dataset; ds=load_dataset('json', data_files='sad.jsonl')['train'].train_test_split(test_size=0.25, seed=42); ds['train'].to_parquet('sad/data/train-00000-of-00001.parquet'); ds['test'].to_parquet('sad/data/test-00000-of-00001.parquet')"
+
+t to Hugging Face, chat with it to test how well it works, or run standard 
+benchmarks on it. You can return to this menu later to select a different trial.
+Note that KL divergence values above 0.5 usually indicate significant damage to 
+the original model's capabilities.
+
+? Which trial do you want to use? [Trial 102] Refusals:  4/40, KL divergence: 0.
+0431
+
+Hello! Please review AGENTS.md and HANDOFF.md, then mark everything as reviewed. Then move onto the 
+next five chunks.
+
+# in the qlora-venv
+export LLAMA1B=/mnt/two/Weights/meta-llama-Llama-3.2-1B-Instruct/4/
+export GEMMA4=/home/unstable/weights/google_gemma-4-12B-it/4.00bpw/        # for the Liger/Gemma parity check
+export OUT=/mnt/two/Weights/qlora_test
+pip install torchao liger-kernel                   # new deps (A needs torchao, C needs liger)
+

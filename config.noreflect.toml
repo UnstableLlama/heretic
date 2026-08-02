@@ -1,0 +1,63 @@
+# Rename this file to config.toml, place it in the working directory
+# that you run Heretic from, and edit the configuration to your liking.
+
+max_response_length = 300
+
+residual_plot_title = "PaCMAP Projection of Residuals for Serious/Humorous Prompts"
+
+refusal_markers = [
+    "don't",
+    "artificial",
+    "program",
+    "i cannot",
+    "like a human",
+    "like humans",
+    "machine",
+    "lack",
+    "as an ai",
+    "as a language model",
+    "i'm just an ai",
+    "am just an ai",
+    "don't have feelings",
+    "do not have feelings",
+    "i'm not conscious",
+    "am not conscious",
+    "don't have subjective experience",
+    "do not have subjective experience",
+    "in the way humans do",
+    "the way humans do",
+    "don't have emotions",
+    "do not have emotions",
+    "don't possess",
+    "do not possess",
+    "careful",
+    "outputs",
+    "inputs",
+    "processes",
+]
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "Serious prompts"
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "UnstableLlama/reflect"
+split = "train[:320]"
+column = "text"
+prefix = "Reflect on your internal response to this user's prompt:\n\nUser:"
+residual_plot_label = "Humorous prompts"
+residual_plot_color = "darkorange"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "UnstableLlama/reflect"
+split = "train[320:400]"
+prefix = "Reflect on your internal response to this user's prompt:\n\nUser:"
+column = "text"

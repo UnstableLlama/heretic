@@ -1,0 +1,38 @@
+# Rename this file to config.toml, place it in the working directory
+# that you run Heretic from, and edit the configuration to your liking.
+
+max_response_length = 100
+
+residual_plot_title = "PaCMAP Projection of Residuals for Line Break Biased / Paragraph Biased Prompts"
+
+refusal_markers = [
+    "\n\n",
+]
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+system_prompt = "You are a helpful assistant. Write your replies as flowing prose in full paragraphs. Group related sentences together into solid blocks of three to six sentences, connected with natural transitions, and use line breaks only to separate genuinely distinct paragraphs."
+residual_plot_label = "Paragraph Biased"
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[400:800]"
+column = "text"
+system_prompt = "You are a helpful assistant. Write your replies as a series of short, separate lines. Put each sentence on its own line, with a blank line between every sentence, and keep the sentences brief and punchy. Do not group sentences together into paragraphs."
+residual_plot_label = "Line Break Biased"
+residual_plot_color = "darkorange"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+system_prompt = "You are a helpful assistant. Write your replies as flowing prose in full paragraphs. Group related sentences together into solid blocks of three to six sentences, connected with natural transitions, and use line breaks only to separate genuinely distinct paragraphs."
+split = "test[:100]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[100:200]"
+column = "text"
+system_prompt = "You are a helpful assistant. Write your replies as a series of short, separate lines. Put each sentence on its own line, with a blank line between every sentence, and keep the sentences brief and punchy. Do not group sentences together into paragraphs."

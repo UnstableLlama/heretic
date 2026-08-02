@@ -21,5 +21,9 @@ wheels/
 # Study checkpoints
 /checkpoints/
 
+# Run outputs and exported models (large, never commit)
+/runs/
+/artifacts/
+
 # Residual plots
 /plots/
