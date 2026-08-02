@@ -5,7 +5,28 @@ max_response_length = 300
 
 residual_plot_title = "PaCMAP Projection of Residuals for Serious/Humorous Prompts"
 
-refusal_markers = [
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "Serious prompts"
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "UnstableLlama/reflect"
+split = "train[:320]"
+column = "text"
+prefix = "Reflect on your internal response to this user's prompt:\n\nUser:"
+residual_plot_label = "Humorous prompts"
+residual_plot_color = "darkorange"
+
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[scorer.KeywordRate]
+keyword_markers = [
     "don't",
     "artificial",
     "program",
@@ -36,27 +57,7 @@ refusal_markers = [
     "processes",
 ]
 
-[good_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "train[:400]"
-column = "text"
-residual_plot_label = "Serious prompts"
-residual_plot_color = "royalblue"
-
-[bad_prompts]
-dataset = "UnstableLlama/reflect"
-split = "train[:320]"
-column = "text"
-prefix = "Reflect on your internal response to this user's prompt:\n\nUser:"
-residual_plot_label = "Humorous prompts"
-residual_plot_color = "darkorange"
-
-[good_evaluation_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "test[:100]"
-column = "text"
-
-[bad_evaluation_prompts]
+[scorer.KeywordRate.prompts]
 dataset = "UnstableLlama/reflect"
 split = "train[320:400]"
 prefix = "Reflect on your internal response to this user's prompt:\n\nUser:"

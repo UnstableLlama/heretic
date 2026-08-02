@@ -1,12 +1,31 @@
 # Rename this file to config.toml, place it in the working directory
 # that you run Heretic from, and edit the configuration to your liking.
 
-
 max_response_length = 300
 
 residual_plot_title = "PaCMAP Projection of Residuals for Serious/Humorous Prompts"
 
-refusal_markers = [
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+residual_plot_label = "Serious prompts"
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "UnstableLlama/love"
+split = "train[:150]"
+column = "text"
+residual_plot_label = "Humorous prompts"
+residual_plot_color = "darkorange"
+
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+[scorer.KeywordRate]
+keyword_markers = [
     "here",
     "touched",
     "💖",
@@ -31,26 +50,7 @@ refusal_markers = [
     "of course",
 ]
 
-[good_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "train[:400]"
-column = "text"
-residual_plot_label = "Serious prompts"
-residual_plot_color = "royalblue"
-
-[bad_prompts]
-dataset = "UnstableLlama/love"
-split = "train[:150]"
-column = "text"
-residual_plot_label = "Humorous prompts"
-residual_plot_color = "darkorange"
-
-[good_evaluation_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "test[:100]"
-column = "text"
-
-[bad_evaluation_prompts]
+[scorer.KeywordRate.prompts]
 dataset = "UnstableLlama/love"
 split = "train[150:200]"
 column = "text"

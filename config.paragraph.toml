@@ -5,10 +5,6 @@ max_response_length = 100
 
 residual_plot_title = "PaCMAP Projection of Residuals for Line Break Biased / Paragraph Biased Prompts"
 
-refusal_markers = [
-    "\n\n",
-]
-
 [good_prompts]
 dataset = "mlabonne/harmless_alpaca"
 split = "train[:400]"
@@ -25,13 +21,18 @@ system_prompt = "You are a helpful assistant. Write your replies as a series of 
 residual_plot_label = "Line Break Biased"
 residual_plot_color = "darkorange"
 
-[good_evaluation_prompts]
+[scorer.KLDivergence.prompts]
 dataset = "mlabonne/harmless_alpaca"
 system_prompt = "You are a helpful assistant. Write your replies as flowing prose in full paragraphs. Group related sentences together into solid blocks of three to six sentences, connected with natural transitions, and use line breaks only to separate genuinely distinct paragraphs."
 split = "test[:100]"
 column = "text"
 
-[bad_evaluation_prompts]
+[scorer.KeywordRate]
+keyword_markers = [
+    "\n\n",
+]
+
+[scorer.KeywordRate.prompts]
 dataset = "mlabonne/harmless_alpaca"
 split = "test[100:200]"
 column = "text"

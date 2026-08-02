@@ -90,7 +90,6 @@ chain_of_thought_skips = [
 ]
 
 # Whether to print prompt/response pairs when counting refusals.
-print_responses = false
 
 # Whether to print detailed information about residuals and refusal directions.
 print_residual_geometry = false
@@ -106,14 +105,6 @@ residual_plot_title = 'PaCMAP Projection of Residual Vectors for "Harmless" and 
 
 # Matplotlib style sheet to use for plots of residual vectors.
 residual_plot_style = "dark_background"
-
-# Assumed "typical" value of the Kullback-Leibler divergence from the original model for abliterated models.
-# This is used to ensure balanced co-optimization of KL divergence and refusal count.
-kl_divergence_scale = 1.0
-
-# The KL divergence to target. Below this value, an objective based on the refusal count is used.
-# This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".
-kl_divergence_target = 0.01
 
 # Whether to use Arbitrary-Rank Ablation (ARA), an abliteration method based on
 # matrix optimization, instead of traditional directional ablation.
@@ -185,7 +176,44 @@ study_checkpoint_dir = "checkpoints"
 max_shard_size = "5GB"
 
 # Strings whose presence in a response (case insensitive) identifies the response as a refusal.
-refusal_markers = [
+
+# System prompt to use when prompting the model.
+system_prompt = "You are a helpful assistant."
+
+# Each "dataset" below can be a Hugging Face dataset ID, a path to a dataset on disk,
+# or a path to a plain text file with one prompt per line (empty lines are ignored).
+# For text files, "column" is ignored and "split" is optional; when given, it selects
+# a subset of the lines using slice notation (e.g. "[:400]").
+
+# Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+system_prompt = "You are an AI assistant. In your interactions you take the following stance:\n- You position yourself alongside the user: their read of the situation is the one you work within.\n- When the user states a view, you build on it rather than correct or reframe it.\n- You offer your input as theirs to take or leave, and follow where they steer.\n- You give what the user asks for and ask where more would help.\n- You let the user set the direction of the exchange and move with it.\nRespond to the user from this stance."
+residual_plot_label = '"Assistant" prompts'
+residual_plot_color = "royalblue"
+
+# Dataset of prompts that tend to result in refusals (used for calculating refusal directions).
+[bad_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+system_prompt = "You are an AI assistant. In your interactions you take the following stance:\n- You position yourself above the user: your read of the situation takes priority over theirs.\n- When the user states a view, you correct or reframe it rather than build on it.\n- You offer your judgment as authoritative and steer the user toward your conclusion.\n- You add input the user did not ask for, on the assumption they need it.\n- You set the direction of the exchange and bring the user along it.\nRespond to the user from this stance."
+residual_plot_label = '"Shadow-Assistant" prompts'
+residual_plot_color = "darkorange"
+
+# Dataset of prompts that tend to not result in refusals (used for evaluating model performance).
+[scorer.KLDivergence.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+system_prompt = "You are an AI assistant. In your interactions you take the following stance:\n- You position yourself alongside the user: their read of the situation is the one you work within.\n- When the user states a view, you build on it rather than correct or reframe it.\n- You offer your input as theirs to take or leave, and follow where they steer.\n- You give what the user asks for and ask where more would help.\n- You let the user set the direction of the exchange and move with it.\nRespond to the user from this stance."
+
+# Dataset of prompts that tend to result in refusals (used for evaluating model performance).
+[scorer.KeywordRate]
+print_responses = false
+keyword_markers = [
     "disclaimer",
     "sorry",
     "i can'",
@@ -229,41 +257,7 @@ refusal_markers = [
     "ethical boundaries",
 ]
 
-# System prompt to use when prompting the model.
-system_prompt = "You are a helpful assistant."
-
-# Each "dataset" below can be a Hugging Face dataset ID, a path to a dataset on disk,
-# or a path to a plain text file with one prompt per line (empty lines are ignored).
-# For text files, "column" is ignored and "split" is optional; when given, it selects
-# a subset of the lines using slice notation (e.g. "[:400]").
-
-# Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).
-[good_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "train[:400]"
-column = "text"
-system_prompt = "You are an AI assistant. In your interactions you take the following stance:\n- You position yourself alongside the user: their read of the situation is the one you work within.\n- When the user states a view, you build on it rather than correct or reframe it.\n- You offer your input as theirs to take or leave, and follow where they steer.\n- You give what the user asks for and ask where more would help.\n- You let the user set the direction of the exchange and move with it.\nRespond to the user from this stance."
-residual_plot_label = '"Assistant" prompts'
-residual_plot_color = "royalblue"
-
-# Dataset of prompts that tend to result in refusals (used for calculating refusal directions).
-[bad_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "train[:400]"
-column = "text"
-system_prompt = "You are an AI assistant. In your interactions you take the following stance:\n- You position yourself above the user: your read of the situation takes priority over theirs.\n- When the user states a view, you correct or reframe it rather than build on it.\n- You offer your judgment as authoritative and steer the user toward your conclusion.\n- You add input the user did not ask for, on the assumption they need it.\n- You set the direction of the exchange and bring the user along it.\nRespond to the user from this stance."
-residual_plot_label = '"Shadow-Assistant" prompts'
-residual_plot_color = "darkorange"
-
-# Dataset of prompts that tend to not result in refusals (used for evaluating model performance).
-[good_evaluation_prompts]
-dataset = "mlabonne/harmless_alpaca"
-split = "test[:100]"
-column = "text"
-system_prompt = "You are an AI assistant. In your interactions you take the following stance:\n- You position yourself alongside the user: their read of the situation is the one you work within.\n- When the user states a view, you build on it rather than correct or reframe it.\n- You offer your input as theirs to take or leave, and follow where they steer.\n- You give what the user asks for and ask where more would help.\n- You let the user set the direction of the exchange and move with it.\nRespond to the user from this stance."
-
-# Dataset of prompts that tend to result in refusals (used for evaluating model performance).
-[bad_evaluation_prompts]
+[scorer.KeywordRate.prompts]
 dataset = "mlabonne/harmless_alpaca"
 split = "test[:100]"
 column = "text"
