@@ -168,6 +168,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    exl3_load_max_chunk_size: int = Field(
+        default=512,
+        description=(
+            "EXL3 backend only: max_chunk_size passed to exllamav3's Model.load(). "
+            "This sizes the single-sequence measuring forward the autosplit runs "
+            "through each module to estimate activation memory; it does NOT limit "
+            "runtime forwards (those are bounded by exl3_max_num_tokens). Large "
+            "MoE models (e.g. Laguna, 256 experts) OOM during load with the "
+            "exllamav3 default of 2048 even though weights and real forwards fit, "
+            "so Heretic probes with a smaller chunk. Raise it if a model needs a "
+            "larger activation reservation to place layers correctly."
+        ),
+    )
+
     exl3_base_model: str | None = Field(
         default=None,
         description=(

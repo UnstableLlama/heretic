@@ -307,6 +307,17 @@ class Exl3Model:
 
         gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
+        # Cap the autosplit's per-module measuring forward. exllamav3 runs a
+        # single-sequence forward of max_chunk_size tokens through each module
+        # during the layer split to estimate activation memory. For large MoE
+        # models (e.g. Laguna, 256 experts) this probe OOMs at the default 2048
+        # even when the weights and heretic's real (batched) forwards fit
+        # comfortably, aborting the load with "Insufficient VRAM in split". This
+        # only sizes the probe; runtime forwards are bounded by the cache
+        # (exl3_max_num_tokens), not this value.
+        if "max_chunk_size" in accepted:
+            kwargs["max_chunk_size"] = self.settings.exl3_load_max_chunk_size
+
         if gpu_count > 1:
             gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
             print(f"* CUDA devices visible to Heretic: [bold]{gpu_count}[/]")
