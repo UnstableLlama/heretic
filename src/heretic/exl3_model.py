@@ -184,7 +184,11 @@ class Exl3Model:
         self.settings = settings
         self.needs_reload = False
         self.revision_kwargs: dict[str, Any] = {}
-        self.trusted_models: dict[str, bool | None] = {settings.model: False}
+        # Matches the HF backend: a set of models the user has agreed to run
+        # remote code for. EXL3 model dirs never require remote code.
+        self.trusted_models: set[str] = set()
+        # No multimodal processor on the EXL3 path (text-only backend).
+        self.processor = None
         self._inspect_only = inspect_only
 
         # Import lazily so the optional dep doesn't crash users on the HF path.
@@ -1216,21 +1220,22 @@ class Exl3Model:
         assert running_sum is not None
         return (running_sum / total).to(torch.float32)
 
-    def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
+    def get_logits(self, prompts: list[Prompt]) -> Tensor:
         input_ids = self._tokenize_chat(prompts)
         logits, _ = self._forward(input_ids, last_only=True)
         # logits shape: (B, 1, vocab) when last_tokens_only=1.
+        # Raw logits over the vocabulary; the KL divergence scorer applies
+        # log_softmax itself (matches the HF backend's get_logits contract).
         last_logits = logits[:, -1, :]
-        logprobs = F.log_softmax(last_logits, dim=-1)
         if self.settings.offload_outputs_to_cpu:
-            logprobs = logprobs.cpu()
+            last_logits = last_logits.cpu()
             empty_cache()
-        return logprobs
+        return last_logits
 
-    def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
+    def get_logits_batched(self, prompts: list[Prompt]) -> Tensor:
         out = []
         for batch in batchify(prompts, self.settings.batch_size):
-            out.append(self.get_logprobs(batch))
+            out.append(self.get_logits(batch))
         return torch.cat(out, dim=0)
 
     # ------------------------------------------------------------------
@@ -1392,7 +1397,7 @@ class Exl3Model:
             hf_base,
             torch_dtype=torch.bfloat16,
             device_map="cpu",
-            trust_remote_code=bool(self.settings.trust_remote_code),
+            trust_remote_code=None,
         )
 
         target_module_names: set[str] = set()

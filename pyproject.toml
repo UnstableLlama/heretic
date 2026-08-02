@@ -1,6 +1,6 @@
 [project]
 name = "heretic-llm"
-version = "1.3.0"
+version = "1.4.0"
 description = "Fully automatic censorship removal for language models"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -38,6 +38,8 @@ dependencies = [
     "questionary~=2.1",
     "rich~=14.3",
     "tomli-w~=1.2",
+    "torch",  # version deliberately unspecified
+    "torchvision",  # version deliberately unspecified
     "tqdm~=4.67",
     "transformers[kernels]~=5.6",
 ]
@@ -52,12 +54,12 @@ research = [
 ]
 exl3 = [
     # ExLlamaV3 ships compiled CUDA kernels and exposes internals that
-    # change across point releases (Module iteration, TransformerBlock
+    # change across releases (Module iteration, TransformerBlock
     # .export_state, LinearEXL3.get_weight_tensor, Linear.lora_a/b_tensors).
-    # Pin a known-good version and re-audit before bumping. The master
-    # branch is 0.0.34 but the latest PyPI release is 0.0.33; the API
-    # surface this code targets is stable across both.
-    "exllamav3==0.0.33",
+    # This code is audited against the 1.3.0 API (in practice installed as
+    # an editable local fork of exllamav3); PyPI may lag behind. Re-audit
+    # the internals above before bumping across major versions.
+    "exllamav3>=1.1.0",
     "safetensors>=0.4",
 ]
 
@@ -68,8 +70,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/p-e-w/heretic"
-Documentation = "https://github.com/p-e-w/heretic"
+Homepage = "https://heretic-project.org"
+Documentation = "https://heretic-project.org/tutorial"
 Repository = "https://github.com/p-e-w/heretic.git"
 Issues = "https://github.com/p-e-w/heretic/issues"
 Changelog = "https://github.com/p-e-w/heretic/releases"

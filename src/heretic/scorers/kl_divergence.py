@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
+
+import math
+
+import torch.nn.functional as F
+from optuna import TrialPruned
+from pydantic import BaseModel, Field
+
+from heretic.config import DatasetSpecification
+from heretic.plugin import Context
+from heretic.scorer import Score, Scorer
+from heretic.utils import print
+
+
+class Settings(BaseModel):
+    prompts: DatasetSpecification = Field(
+        default=DatasetSpecification(
+            dataset="mlabonne/harmless_alpaca",
+            split="test[:100]",
+            column="text",
+        ),
+        description="Prompt dataset used to measure KL divergence from original model.",
+    )
+
+
+class KLDivergence(Scorer):
+    """
+    KL divergence between current model and baseline.
+
+    Measures how much the model's behavior has drifted from baseline.
+    Lower is better (less damage).
+    """
+
+    settings: Settings
+
+    @property
+    def reproducible(self) -> bool:
+        return True
+
+    @property
+    def score_name(self) -> str:
+        return "KL divergence"
+
+    def init(self, ctx: Context) -> None:
+        print()
+        print(
+            f"Loading KLDivergence evaluation prompts from [bold]{self.settings.prompts.dataset}[/]..."
+        )
+        self.prompts = ctx.load_prompts(self.settings.prompts)
+        print(f"* [bold]{len(self.prompts)}[/] prompts loaded")
+
+        print("* Obtaining baseline first-token probability distributions...")
+        baseline_logits = ctx.get_logits(self.prompts)
+
+        self._baseline_logprobs = F.log_softmax(baseline_logits, dim=-1)
+
+    def get_score(self, ctx: Context) -> Score:
+        logits = ctx.get_logits(self.prompts)
+        logprobs = F.log_softmax(logits, dim=-1)
+        kl = F.kl_div(
+            logprobs,
+            self._baseline_logprobs,
+            reduction="batchmean",
+            log_target=True,
+        ).item()
+
+        if not math.isfinite(kl):
+            # Abliteration blew up the forward pass (overflowed fp16 or
+            # produced NaN logits). The model emits garbage, so every other
+            # score is meaningless too (e.g. the keyword rate of gibberish
+            # responses is spuriously low). Prune the trial so it is excluded
+            # from the Pareto front instead of poisoning it. List this scorer
+            # before KeywordRate in [[scorers]] to also skip the pointless
+            # response generation.
+            print(
+                "  * [yellow]KL divergence is non-finite (abliteration blew up); "
+                "pruning trial.[/] Consider setting [bold]ara_lora_regularization[/] "
+                "to a small positive value (e.g. 1e-3) to bound the LoRA factors."
+            )
+            raise TrialPruned("Non-finite KL divergence")
+
+        return Score(
+            value=kl,
+            rich_display=f"{kl:.4f}",
+            md_display=f"{kl:.4f}",
+        )
+
+    def get_baseline_score(self, ctx: Context) -> Score:
+        return Score(
+            value=0,
+            rich_display="0 (by definition)",
+            md_display="0 *(by definition)*",
+        )

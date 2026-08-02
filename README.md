@@ -1,6 +1,6 @@
-<img width="128" height="128" align="right" alt="Logo" src="https://github.com/user-attachments/assets/df5f2840-2f92-4991-aa57-252747d7182e" />
+<img width="128" align="right" alt="Logo" src="https://github.com/user-attachments/assets/df5f2840-2f92-4991-aa57-252747d7182e" />
 
-# Heretic: Fully automatic censorship removal for language models<br><br>[![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT) [![Follow us on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/follow-us-on-hf-md-dark.svg)](https://huggingface.co/heretic-org) [![Codeberg mirror](https://img.shields.io/badge/Codeberg%20mirror-black?logo=codeberg&style=for-the-badge)](https://codeberg.org/p-e-w/heretic)
+# Heretic: Fully automatic censorship removal for language models<br><br>[![Discord](https://img.shields.io/discord/1447831134212984903?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/gdXc48gSyT) [![Matrix](https://img.shields.io/badge/Matrix-black?logo=matrix&style=for-the-badge)](https://matrix.to/#/#heretic:matrix.org) [![Follow us on Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/follow-us-on-hf-md-dark.svg)](https://huggingface.co/heretic-org) [![Codeberg mirror](https://img.shields.io/badge/Codeberg%20mirror-black?logo=codeberg&style=for-the-badge)](https://codeberg.org/p-e-w/heretic)
 
 [![#1 Repository of the Day](https://trendshift.io/api/badge/repositories/20538)](https://trendshift.io/repositories/20538)
 
@@ -77,7 +77,7 @@ produced by competing abliteration tools:
 [2](https://old.reddit.com/r/LocalLLaMA/comments/1sy18lx/abliterlitics_benchmarks_and_tensor_comparison/).
 
 The community has created and published
-[well over 3000](https://huggingface.co/models?other=heretic)
+[well over 4000](https://huggingface.co/models?other=heretic)
 models with Heretic.
 
 
@@ -86,7 +86,7 @@ models with Heretic.
 Prepare a Python 3.10+ environment with PyTorch 2.2+ installed as appropriate
 for your hardware. Then run:
 
-```
+```sh
 pip install -U heretic-llm
 heretic Qwen/Qwen3-4B-Instruct-2507
 ```
@@ -134,8 +134,8 @@ provides features designed to support research into the semantics of model inter
 (interpretability). To use those features, you need to install Heretic with the
 optional `research` extra:
 
-```
-pip install -U heretic-llm[research]
+```sh
+pip install -U 'heretic-llm[research]'
 ```
 
 This gives you access to the following functionality:
@@ -200,8 +200,8 @@ g = mean of residual vectors for good prompts
 g* = geometric median of residual vectors for good prompts
 b = mean of residual vectors for bad prompts
 b* = geometric median of residual vectors for bad prompts
-r = refusal direction for means (i.e., b - g)
-r* = refusal direction for geometric medians (i.e., b* - g*)
+r = residual direction for means (i.e., b - g)
+r* = residual direction for geometric medians (i.e., b* - g*)
 S(x,y) = cosine similarity of x and y
 |x| = L2 norm of x
 Silh = Mean silhouette coefficient of residuals for good/bad clusters
@@ -213,18 +213,18 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 Heretic implements a parametrized variant of directional ablation. For each
 supported transformer component (currently, attention out-projection and
 MLP down-projection), it identifies the associated matrices in each transformer
-layer, and orthogonalizes them with respect to the relevant "refusal direction",
+layer, and orthogonalizes them with respect to the relevant "residual direction",
 inhibiting the expression of that direction in the result of multiplications
 with that matrix.
 
-Refusal directions are computed for each layer as a difference-of-means between
+Residual directions are computed for each layer as a difference-of-means between
 the first-token residuals for "harmful" and "harmless" example prompts.
 
 The ablation process is controlled by several optimizable parameters:
 
-* `direction_index`: Either the index of a refusal direction, or the special
+* `direction_index`: Either the index of a residual direction, or the special
   value `per layer`, indicating that each layer should be ablated using the
-  refusal direction associated with that layer.
+  residual direction associated with that layer.
 * `max_weight`, `max_weight_position`, `min_weight`, and `min_weight_distance`:
   For each component, these parameters describe the shape and position of the
   ablation weight kernel over the layers. The following diagram illustrates this:
@@ -239,8 +239,8 @@ Heretic's main innovations over existing abliteration systems are:
   automatic parameter optimization, can improve the compliance/quality tradeoff.
   Non-constant ablation weights were previously explored by Maxime Labonne in
   [gemma-3-12b-it-abliterated-v2](https://huggingface.co/mlabonne/gemma-3-12b-it-abliterated-v2).
-* The refusal direction index is a float rather than an integer. For non-integral
-  values, the two nearest refusal direction vectors are linearly interpolated.
+* The residual direction index is a float rather than an integer. For non-integral
+  values, the two nearest residual direction vectors are linearly interpolated.
   This unlocks a vast space of additional directions beyond the ones identified
   by the difference-of-means computation, and often enables the optimization
   process to find a better direction than that belonging to any individual layer.
