@@ -41,7 +41,8 @@ dependencies = [
     "torch",  # version deliberately unspecified
     "torchvision",  # version deliberately unspecified
     "tqdm~=4.67",
-    "transformers[kernels]~=5.6",
+    # 5.15 is the minimum version with Muse Glimmer (muse_glimmer) support.
+    "transformers[kernels]~=5.15",
 ]
 
 [project.optional-dependencies]

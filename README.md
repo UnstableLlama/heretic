@@ -20,7 +20,8 @@ as possible. Using Heretic does not require an understanding of transformer
 internals. In fact, anyone who knows how to run a command-line program
 can use Heretic to decensor language models.
 
-Heretic supports most dense models, including many multimodal models,
+Heretic supports most dense models, including many multimodal models
+(such as Meta's Muse Glimmer, which requires transformers 5.15+),
 several different MoE architectures, and even some hybrid models like Qwen3.5.
 Pure state-space models and certain other research architectures are not yet
 supported out of the box.
