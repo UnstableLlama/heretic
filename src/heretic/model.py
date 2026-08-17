@@ -758,6 +758,13 @@ class Model:
                     for step in range(5):
                         optimizer.step(closure)
 
+                    # Free the gradient buffers accumulated on the weight parameters
+                    # during optimization. Without this, they persist on the model
+                    # (one full-size gradient per processed weight) and can easily
+                    # consume tens of GiB of VRAM, causing out-of-memory errors
+                    # during the subsequent evaluation.
+                    optimizer.zero_grad(set_to_none=True)
+
                     with torch.no_grad():
                         matrix.copy_(get_matrix())
 
@@ -861,6 +868,10 @@ class Model:
 
                     for step in range(5):
                         optimizer.step(closure)
+
+                    # Free the gradient buffers accumulated on the LoRA adapter
+                    # parameters during optimization (see ara_abliterate for details).
+                    optimizer.zero_grad(set_to_none=True)
 
     def get_module_io(
         self,
