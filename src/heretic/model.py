@@ -216,6 +216,13 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
+        if not self.get_abliterable_components():
+            raise RuntimeError(
+                "No abliterable modules found in the model. Check that "
+                f"target_components ({settings.target_components}) matches "
+                "the model architecture."
+            )
+
         if not settings.use_ara or settings.use_ara_lora:
             self._apply_lora()
 
@@ -442,6 +449,9 @@ class Model:
         modules = {}
 
         def try_add(component: str, module: Any):
+            if component not in self.settings.target_components:
+                return
+
             # Only add if it's a proper nn.Module (PEFT can wrap these with LoRA)
             if isinstance(module, Module):
                 if component not in modules:
@@ -500,10 +510,10 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
-        # We need at least one module across all components for abliteration to work.
-        total_modules = sum(len(mods) for mods in modules.values())
-        assert total_modules > 0, "No abliterable modules found in layer"
-
+        # A layer may legitimately be empty here: target_components can exclude
+        # everything it has, and hybrid architectures have layers without
+        # attention. Callers iterate whatever is present, and __init__ verifies
+        # that the model as a whole has at least one target module.
         return modules
 
     def get_abliterable_components(self) -> list[str]:
@@ -866,7 +876,10 @@ class Model:
         self,
         prompts: list[Prompt],
     ) -> ModuleIO:
-        module_io: ModuleIO = []
+        # One entry per layer up front, so layers without targeted modules
+        # (target_components exclusions, or hybrid layers without attention)
+        # stay empty instead of shifting the indices of the layers after them.
+        module_io: ModuleIO = [{} for _ in range(len(self.get_layers()))]
 
         def get_hook(
             layer_index: int,
@@ -878,11 +891,6 @@ class Model:
                 inputs: tuple[Tensor, ...],
                 outputs: Tensor,
             ) -> None:
-                if len(module_io) == layer_index:
-                    module_io.append({})
-
-                assert len(module_io) == layer_index + 1
-
                 if component not in module_io[layer_index]:
                     module_io[layer_index][component] = {}
 

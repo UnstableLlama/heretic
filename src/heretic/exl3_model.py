@@ -503,6 +503,8 @@ class Exl3Model:
 
         by_layer: dict[int, dict[str, list[Any]]] = {}
         all_keys: list[str] = []
+        # Highest layer index with any matchable module, targeted or not.
+        matched_layer_max = -1
 
         for module in self.model:
             key = getattr(module, "key", None)
@@ -515,6 +517,7 @@ class Exl3Model:
             if not isinstance(module, Linear):
                 continue
             layer_idx = int(m.group(1))
+            matched_layer_max = max(matched_layer_max, layer_idx)
             leaf = m.group(2)  # "o_proj" | "out_proj" | "down_proj"
             if leaf == "down_proj":
                 component = "mlp.down_proj"
@@ -523,9 +526,20 @@ class Exl3Model:
                 # linear attention, e.g. Qwen3.5 GatedDeltaNet) feed into
                 # the same residual stream and should be ablated together.
                 component = "attn.o_proj"
+            if component not in self.settings.target_components:
+                # Excluded by target_components: no LoRA slot, no capture,
+                # no abliteration for this module.
+                continue
             by_layer.setdefault(layer_idx, {}).setdefault(component, []).append(module)
 
         self._all_module_keys = all_keys
+
+        if matched_layer_max >= 0 and not by_layer:
+            raise RuntimeError(
+                "No abliterable modules left after applying target_components "
+                f"({self.settings.target_components}); the model only has modules "
+                "of the excluded component(s)."
+            )
 
         if not by_layer:
             # Don't crash here — the inspect script needs to dump module
@@ -541,9 +555,13 @@ class Exl3Model:
             self._layer_modules = []
             return
 
-        # Materialize into a contiguous list indexed by layer number.
-        max_layer = max(by_layer.keys())
-        self._layer_modules = [by_layer.get(i, {}) for i in range(max_layer + 1)]
+        # Materialize into a contiguous list indexed by layer number. Size it by
+        # every layer that has a matchable module, not just the targeted ones,
+        # so excluding the only component present in the last layers doesn't
+        # shorten the list and break layer-indexed lookups later on.
+        self._layer_modules = [
+            by_layer.get(i, {}) for i in range(matched_layer_max + 1)
+        ]
 
         # Pre-allocate LoRA tensors on every target Linear.
         # Shapes: A is (in_features, 1), B is (1, out_features). Both fp16.
