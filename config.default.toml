@@ -140,6 +140,22 @@ use_ara_lora = false
 # the 'arbitrary' effect.
 ara_lora_rank = 128
 
+# Number of response tokens to generate while capturing module I/O for ARA.
+# Every generated position becomes an additional optimization sample, so ARA
+# also steers the model while it writes its response (e.g. while it reasons),
+# not only at the position where the response starts. 0 captures the start
+# position only. Captured activations grow linearly with this value (roughly
+# prompts x tokens x hidden size x 2 bytes, twice per targeted module).
+# HF backend only.
+ara_capture_tokens = 0
+
+# Response prefix to use while capturing module I/O for ARA, instead of
+# response_prefix. Lets ARA capture at a different position than the one the
+# scorers evaluate, e.g. capture at the start of the final answer
+# ("\n</think>\n\n" on Qwen3.5-style templates) while scoring in thinking
+# mode (response_prefix = ""). Leave unset to capture where evaluation happens.
+#ara_capture_prefix = ""
+
 # Search range for the ARA inner-objective "steer_bad_behavior_weight", which the
 # outer optimizer samples on a log scale. Applies to both ARA and ARA-LoRA.
 # The max defaults to 0.001: the optimizer reliably prefers the low end, and

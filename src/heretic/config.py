@@ -500,6 +500,29 @@ class Settings(BaseSettings):
         ),
     )
 
+    ara_capture_tokens: NonNegativeInt = Field(
+        default=0,
+        description=(
+            "Number of response tokens to generate while capturing module I/O for ARA. "
+            "Every generated position becomes an additional optimization sample, so ARA "
+            "also steers the model while it writes its response (e.g. while it reasons), "
+            "not only at the position where the response starts. 0 captures the start "
+            "position only. Captured activations grow linearly with this value. "
+            "HF backend only."
+        ),
+    )
+
+    ara_capture_prefix: str | None = Field(
+        default=None,
+        description=(
+            "Response prefix to use while capturing module I/O for ARA, instead of "
+            "response_prefix. Lets ARA capture at a different position than the one "
+            "the scorers evaluate, e.g. capture at the start of the final answer while "
+            "scoring responses in thinking mode. An empty string means no prefix; "
+            "leave unset to capture where evaluation happens."
+        ),
+    )
+
     steer_bad_behavior_weight_min: float = Field(
         default=0.0001,
         description=(

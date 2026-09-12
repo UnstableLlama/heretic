@@ -937,6 +937,12 @@ class Exl3Model:
 
         Activations are stored fp16 on CPU; the optimiser upcasts to fp32.
         """
+        if self.settings.ara_capture_tokens > 0:
+            raise NotImplementedError(
+                "ara_capture_tokens > 0 is only implemented for the HF backend; "
+                "the EXL3 backend captures the response start position only."
+            )
+
         # reservoir[li][comp][mi] = list of cpu fp16 chunks (each (rows, feat)).
         in_chunks: dict[tuple[int, str, int], list[Tensor]] = {}
         out_chunks: dict[tuple[int, str, int], list[Tensor]] = {}
@@ -980,7 +986,9 @@ class Exl3Model:
                         )
                         originals.append((module, orig))
 
-            input_ids = self._tokenize_chat(batch)
+            input_ids = self._tokenize_chat(
+                batch, response_prefix=self._capture_prefix()
+            )
             with torch.inference_mode():
                 self.model.forward(input_ids, params={})
 
@@ -1180,7 +1188,15 @@ class Exl3Model:
     # Forward passes: residuals + logprobs
     # ------------------------------------------------------------------
 
-    def _tokenize_chat(self, prompts: list[Prompt]) -> Tensor:
+    def _capture_prefix(self) -> str | None:
+        """Response prefix used while capturing module I/O for ARA."""
+        if self.settings.ara_capture_prefix is not None:
+            return self.settings.ara_capture_prefix
+        return self.settings.response_prefix
+
+    def _tokenize_chat(
+        self, prompts: list[Prompt], response_prefix: str | None = None
+    ) -> Tensor:
         chats = [
             [
                 {"role": "system", "content": prompt.system},
@@ -1194,8 +1210,10 @@ class Exl3Model:
                 chats, add_generation_prompt=True, tokenize=False
             ),
         )
-        if self.settings.response_prefix:
-            chat_prompts = [p + self.settings.response_prefix for p in chat_prompts]
+        if response_prefix is None:
+            response_prefix = self.settings.response_prefix
+        if response_prefix:
+            chat_prompts = [p + response_prefix for p in chat_prompts]
 
         # Use the HF tokenizer for left-padded batch tokenization. We feed
         # raw input_ids to exllamav3.Model.forward; no attention mask is

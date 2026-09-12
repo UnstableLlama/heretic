@@ -894,25 +894,26 @@ class Model:
         # stay empty instead of shifting the indices of the layers after them.
         module_io: ModuleIO = [{} for _ in range(len(self.get_layers()))]
 
+        # Every forward pass appends one (input, output) pair per module, taken at
+        # the last position of that pass: the end of the prompt during prefill, then
+        # each generated token during decoding when ara_capture_tokens > 0.
+        captured: dict[tuple[int, str, int], list[tuple[Tensor, Tensor]]] = {}
+
         def get_hook(
             layer_index: int,
             component: str,
             module_index: int,
         ) -> Callable[[Module, tuple[Tensor, ...], Tensor], None]:
+            key = (layer_index, component, module_index)
+
             def hook(
                 module: Module,
                 inputs: tuple[Tensor, ...],
                 outputs: Tensor,
             ) -> None:
-                if component not in module_io[layer_index]:
-                    module_io[layer_index][component] = {}
-
-                assert module_index not in module_io[layer_index][component]
-
                 input = inputs[0][:, -1, :].detach().clone().cpu()
                 output = outputs[:, -1, :].detach().clone().cpu()
-
-                module_io[layer_index][component][module_index] = (input, output)
+                captured.setdefault(key, []).append((input, output))
 
             return hook
 
@@ -927,12 +928,74 @@ class Model:
                         )
                     )
 
-        self.generate(prompts, max_new_tokens=1)
+        try:
+            inputs, outputs = self.generate(
+                prompts,
+                response_prefix=self._capture_prefix(),
+                max_new_tokens=max(1, self.settings.ara_capture_tokens),
+            )
+        finally:
+            for hook_handle in hook_handles:
+                hook_handle.remove()
 
-        for hook_handle in hook_handles:
-            hook_handle.remove()
+        # Positions generated after a sequence has ended are padding; drop them.
+        sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs
+        generated = cast(Tensor, sequences)[:, inputs.input_ids.shape[1] :]
+        valid = self._generation_validity_mask(generated)
+
+        for (layer_index, component, module_index), steps in captured.items():
+            if len(steps) == valid.shape[1] and all(
+                step[0].shape[0] == valid.shape[0] for step in steps
+            ):
+                # (prompt, step, features): keep the valid (prompt, step) pairs as rows.
+                input = torch.stack([step[0] for step in steps], dim=1)[valid]
+                output = torch.stack([step[1] for step in steps], dim=1)[valid]
+            else:
+                # Modules that are not invoked on every pass or for every prompt
+                # (e.g. routed experts): keep whatever was captured, unmasked.
+                input = torch.cat([step[0] for step in steps], dim=0)
+                output = torch.cat([step[1] for step in steps], dim=0)
+
+            module_io[layer_index].setdefault(component, {})[module_index] = (
+                input,
+                output,
+            )
 
         return module_io
+
+    def _capture_prefix(self) -> str | None:
+        """Response prefix used while capturing module I/O for ARA."""
+        if self.settings.ara_capture_prefix is not None:
+            return self.settings.ara_capture_prefix
+        return self.settings.response_prefix
+
+    def _generation_validity_mask(self, generated: Tensor) -> Tensor:
+        """
+        For a (prompt, step) matrix of generated token ids, mark the steps at which
+        each sequence was still running: everything up to and including its first
+        end-of-sequence token. Later steps are padding and carry no information.
+        """
+        eos_ids: set[int] = set()
+
+        configured = getattr(
+            getattr(self.model, "generation_config", None), "eos_token_id", None
+        )
+        for value in configured if isinstance(configured, list) else [configured]:
+            if isinstance(value, int):
+                eos_ids.add(value)
+
+        tokenizer_eos = getattr(getattr(self, "tokenizer", None), "eos_token_id", None)
+        if isinstance(tokenizer_eos, int):
+            eos_ids.add(tokenizer_eos)
+
+        if not eos_ids:
+            return torch.ones_like(generated, dtype=torch.bool).cpu()
+
+        is_eos = torch.isin(
+            generated, torch.tensor(sorted(eos_ids), device=generated.device)
+        ).int()
+        ended_before = torch.cumsum(is_eos, dim=1) - is_eos
+        return (ended_before == 0).cpu()
 
     def get_module_io_batched(
         self,
@@ -984,6 +1047,7 @@ class Model:
     def generate(
         self,
         prompts: list[Prompt],
+        response_prefix: str | None = None,
         **kwargs: Any,
     ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
         chats = [
@@ -1005,12 +1069,13 @@ class Model:
             ),
         )
 
-        if self.settings.response_prefix:
+        if response_prefix is None:
+            response_prefix = self.settings.response_prefix
+
+        if response_prefix:
             # Append the common response prefix to the prompts so that evaluation happens
             # at the point where responses start to differ for different prompts.
-            chat_prompts = [
-                prompt + self.settings.response_prefix for prompt in chat_prompts
-            ]
+            chat_prompts = [prompt + response_prefix for prompt in chat_prompts]
 
         inputs = self.tokenizer(
             chat_prompts,
