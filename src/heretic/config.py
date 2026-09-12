@@ -164,6 +164,13 @@ class BenchmarkSpecification(BaseModel):
     )
 
 
+# Component names that the model backends know how to discover and abliterate.
+# Both backends map architecture-specific module names onto these two keys
+# (e.g. linear_attn.out_proj -> "attn.o_proj", expert down projections ->
+# "mlp.down_proj"), so they are the complete vocabulary for target_components.
+ABLITERABLE_COMPONENTS = ("attn.o_proj", "mlp.down_proj")
+
+
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
@@ -424,6 +431,32 @@ class Settings(BaseSettings):
             " <optimization> is one of 'minimize', 'maximize', 'none' (do not optimize)."
         ),
     )
+
+    target_components: list[str] = Field(
+        default=list(ABLITERABLE_COMPONENTS),
+        description=(
+            "Components to abliterate. Modules of components not listed here are "
+            "left untouched by both directional ablation and ARA, receive no trial "
+            "parameters, and are skipped during ARA module I/O capture. "
+            'Supported values are "attn.o_proj" and "mlp.down_proj".'
+        ),
+    )
+
+    @field_validator("target_components")
+    @classmethod
+    def validate_target_components(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("must list at least one component")
+
+        unknown = [c for c in value if c not in ABLITERABLE_COMPONENTS]
+        if unknown:
+            raise ValueError(
+                f"unknown component(s) {', '.join(repr(c) for c in unknown)}; "
+                f"supported values are {', '.join(repr(c) for c in ABLITERABLE_COMPONENTS)}"
+            )
+
+        # Drop duplicates while preserving order.
+        return list(dict.fromkeys(value))
 
     use_ara: bool = Field(
         default=False,
