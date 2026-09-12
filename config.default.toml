@@ -119,11 +119,13 @@ scorers = [
 # Components to abliterate. Modules of components not listed here are left
 # untouched by both directional ablation and ARA, receive no trial parameters,
 # and are skipped during ARA module I/O capture. Supported values are
-# "attn.o_proj" and "mlp.down_proj". Ablating the MLP is often unnecessary for
-# removing refusals and tends to damage the model more than ablating the
-# attention output; directional ablation can learn to leave it alone, but ARA
-# has no other way to do so.
-target_components = ["attn.o_proj", "mlp.down_proj"]
+# "attn.o_proj" (full-attention output projection), "attn.out_proj" (linear-
+# attention output projection on hybrid models such as Qwen3.5/3.8) and
+# "mlp.down_proj". Ablating the MLP is often unnecessary for removing refusals
+# and tends to damage the model more than ablating the attention output;
+# directional ablation can learn to leave it alone, but ARA has no other way
+# to do so.
+target_components = ["attn.o_proj", "attn.out_proj", "mlp.down_proj"]
 
 # Whether to use Arbitrary-Rank Ablation (ARA), an abliteration method based on
 # matrix optimization, instead of traditional directional ablation.

@@ -521,10 +521,12 @@ class Exl3Model:
             leaf = m.group(2)  # "o_proj" | "out_proj" | "down_proj"
             if leaf == "down_proj":
                 component = "mlp.down_proj"
+            elif leaf == "out_proj" and ".linear_attn." in key:
+                # Hybrid linear attention (e.g. Qwen3.5 GatedDeltaNet). Kept
+                # apart from full attention so each gets its own parameters
+                # and can be targeted on its own; mirrors the HF backend.
+                component = "attn.out_proj"
             else:
-                # Both "o_proj" (standard attention) and "out_proj" (hybrid
-                # linear attention, e.g. Qwen3.5 GatedDeltaNet) feed into
-                # the same residual stream and should be ablated together.
                 component = "attn.o_proj"
             if component not in self.settings.target_components:
                 # Excluded by target_components: no LoRA slot, no capture,

@@ -467,10 +467,12 @@ class Model:
         with suppress(Exception):
             try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead of
+        # Qwen3.5 hybrid layers use GatedDeltaNet (linear attention) instead of
         # standard self-attention, so self_attn.o_proj doesn't exist on those layers.
+        # Kept as a separate component so linear- and full-attention layers get
+        # their own abliteration parameters and can be targeted independently.
         with suppress(Exception):
-            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("attn.out_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
         with suppress(Exception):

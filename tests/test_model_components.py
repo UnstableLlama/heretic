@@ -39,6 +39,26 @@ def make_model(target_components: list[str] | None = None) -> Model:
     return model
 
 
+class FakeLinearAttention(torch.nn.Module):
+    """Stand-in for a GatedDeltaNet block: exposes `out_proj` only."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.out_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+
+def make_hybrid_layer(model: Model, layer_index: int) -> None:
+    """
+    Turn one layer into a hybrid linear-attention layer the way Qwen3.5/3.8
+    lay them out: `linear_attn.out_proj` instead of `self_attn.o_proj`.
+    Discovery only looks at attributes, so the layer need not stay runnable.
+    """
+    layer = model.get_layers()[layer_index]
+    hidden_size = layer.self_attn.o_proj.out_features
+    del layer.self_attn
+    layer.linear_attn = FakeLinearAttention(hidden_size)
+
+
 def hide_mlp(model: Model, layer_index: int) -> None:
     """
     Make one layer's MLP undiscoverable (no `.down_proj` attribute) while
@@ -68,6 +88,29 @@ class TargetComponentsDiscoveryTests(unittest.TestCase):
             modules = model.get_layer_modules(layer_index)
             self.assertEqual(set(modules), {"attn.o_proj"})
             self.assertEqual(len(modules["attn.o_proj"]), 1)
+
+    def test_linear_attention_is_its_own_component(self) -> None:
+        model = make_model()
+        make_hybrid_layer(model, 1)
+
+        self.assertEqual(
+            model.get_abliterable_components(),
+            ["attn.o_proj", "attn.out_proj", "mlp.down_proj"],
+        )
+        self.assertEqual(
+            set(model.get_layer_modules(0)), {"attn.o_proj", "mlp.down_proj"}
+        )
+        self.assertEqual(
+            set(model.get_layer_modules(1)), {"attn.out_proj", "mlp.down_proj"}
+        )
+
+    def test_linear_attention_can_be_targeted_alone(self) -> None:
+        model = make_model(["attn.out_proj"])
+        make_hybrid_layer(model, 1)
+
+        self.assertEqual(model.get_abliterable_components(), ["attn.out_proj"])
+        self.assertEqual(model.get_layer_modules(0), {})
+        self.assertEqual(set(model.get_layer_modules(1)), {"attn.out_proj"})
 
     def test_layer_without_target_component_is_empty_not_fatal(self) -> None:
         model = make_model(["mlp.down_proj"])

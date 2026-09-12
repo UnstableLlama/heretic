@@ -165,10 +165,13 @@ class BenchmarkSpecification(BaseModel):
 
 
 # Component names that the model backends know how to discover and abliterate.
-# Both backends map architecture-specific module names onto these two keys
-# (e.g. linear_attn.out_proj -> "attn.o_proj", expert down projections ->
-# "mlp.down_proj"), so they are the complete vocabulary for target_components.
-ABLITERABLE_COMPONENTS = ("attn.o_proj", "mlp.down_proj")
+# Both backends map architecture-specific module names onto these keys (e.g.
+# expert down projections -> "mlp.down_proj"), so they are the complete
+# vocabulary for target_components. Hybrid models such as Qwen3.5/3.8 carry
+# two kinds of attention layer, full attention ("attn.o_proj") and linear
+# attention ("attn.out_proj"), which are kept apart so each gets its own
+# abliteration parameters and can be targeted on its own.
+ABLITERABLE_COMPONENTS = ("attn.o_proj", "attn.out_proj", "mlp.down_proj")
 
 
 class Settings(BaseSettings):
@@ -438,7 +441,8 @@ class Settings(BaseSettings):
             "Components to abliterate. Modules of components not listed here are "
             "left untouched by both directional ablation and ARA, receive no trial "
             "parameters, and are skipped during ARA module I/O capture. "
-            'Supported values are "attn.o_proj" and "mlp.down_proj".'
+            'Supported values are "attn.o_proj" (full attention), "attn.out_proj" '
+            '(linear attention on hybrid models) and "mlp.down_proj".'
         ),
     )
 

@@ -52,7 +52,10 @@ class TargetComponentsTests(unittest.TestCase):
     def test_defaults_to_all_components(self) -> None:
         settings = IsolatedSettings(**{"model": "test-model"})
 
-        self.assertEqual(settings.target_components, ["attn.o_proj", "mlp.down_proj"])
+        self.assertEqual(
+            settings.target_components,
+            ["attn.o_proj", "attn.out_proj", "mlp.down_proj"],
+        )
 
     def test_accepts_subset(self) -> None:
         settings = IsolatedSettings(
@@ -70,6 +73,13 @@ class TargetComponentsTests(unittest.TestCase):
         )
 
         self.assertEqual(settings.target_components, ["mlp.down_proj", "attn.o_proj"])
+
+    def test_accepts_linear_attention_component(self) -> None:
+        settings = IsolatedSettings(
+            model="test-model", target_components=["attn.out_proj"]
+        )
+
+        self.assertEqual(settings.target_components, ["attn.out_proj"])
 
     def test_rejects_unknown_component(self) -> None:
         with self.assertRaisesRegex(ValidationError, "unknown component"):
