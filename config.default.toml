@@ -325,3 +325,26 @@ column = "text"
 dataset = "mlabonne/harmless_alpaca"
 split = "test[:100]"
 column = "text"
+
+# Repetition scorer. Opt in by adding it to `scorers`:
+#   { plugin = "heretic.scorers.repetition.Repetition", optimization = "minimize" }
+# Counts responses that degenerate into repetition: the same run of words
+# repeated back to back at least `loop_threshold` times. This catches the
+# failure that neither a refusal keyword check nor a closed-thinking check can
+# see: a model that loops for a while, then still closes its reasoning and
+# stops. Give it the same prompts as the other response-based scorers so they
+# all share one generation per trial.
+[scorer.Repetition]
+score_name = "Looping responses"
+# Shortest and longest run of words that counts as a repeated unit.
+ngram_min = 1
+ngram_max = 20
+# Consecutive repeats of any such unit at or above this count mark a response as looping.
+loop_threshold = 10
+# Whether to print the looping responses with their repeat counts.
+print_responses = false
+
+[scorer.Repetition.prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:100]"
+column = "text"
