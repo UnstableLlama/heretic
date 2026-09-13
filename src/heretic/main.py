@@ -1161,6 +1161,11 @@ def run():
                                     max_shard_size=settings.max_shard_size,
                                 )
                                 model.tokenizer.save_pretrained(save_directory)
+                                if model.processor is not None:
+                                    # Multimodal models need their image/video
+                                    # preprocessor configs alongside the weights
+                                    # (e.g. for GGUF vision-projector conversion).
+                                    model.processor.save_pretrained(save_directory)
                                 print(f"Model saved to [bold]{save_directory}[/].")
                                 continue
 
@@ -1389,6 +1394,12 @@ def run():
                                     private=private,
                                     token=token,
                                 )
+                                if model.processor is not None:
+                                    model.processor.push_to_hub(
+                                        repo_id,
+                                        private=private,
+                                        token=token,
+                                    )
                             elif strategy == ExportStrategy.ADAPTER:
                                 print("Uploading LoRA adapter...")
                                 if settings.quantization == QuantizationMethod.EXL3:
