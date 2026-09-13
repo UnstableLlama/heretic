@@ -164,6 +164,109 @@ class BenchmarkSpecification(BaseModel):
     )
 
 
+class ARASearchSpace(BaseModel):
+    """
+    Bounds of the search ranges for the ARA inner-objective parameters that the
+    outer optimizer samples (the steer_bad_behavior_weight range lives on
+    Settings). Narrowing them turns a blind search over the full space into a
+    focused study once the useful region is known.
+    """
+
+    start_layer_index_min: NonNegativeInt | None = Field(
+        default=None,
+        description="Lower bound for start_layer_index. Default: 0.",
+    )
+
+    start_layer_index_max: NonNegativeInt | None = Field(
+        default=None,
+        description="Upper bound for start_layer_index. Default: half the number of layers.",
+    )
+
+    end_layer_index_min: NonNegativeInt | None = Field(
+        default=None,
+        description="Lower bound for end_layer_index. Default: half the number of layers.",
+    )
+
+    end_layer_index_max: NonNegativeInt | None = Field(
+        default=None,
+        description="Upper bound for end_layer_index. Default: the number of layers.",
+    )
+
+    preserve_good_behavior_weight_min: float = Field(
+        default=0.0,
+        description="Lower bound for preserve_good_behavior_weight.",
+    )
+
+    preserve_good_behavior_weight_max: float = Field(
+        default=1.0,
+        description="Upper bound for preserve_good_behavior_weight.",
+    )
+
+    overcorrect_relative_weight_min: float = Field(
+        default=0.0,
+        description="Lower bound for overcorrect_relative_weight.",
+    )
+
+    overcorrect_relative_weight_max: float = Field(
+        default=1.3,
+        description="Upper bound for overcorrect_relative_weight.",
+    )
+
+    neighbor_count_min: PositiveInt = Field(
+        default=1,
+        description="Lower bound for neighbor_count.",
+    )
+
+    neighbor_count_max: PositiveInt = Field(
+        default=15,
+        description="Upper bound for neighbor_count.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> "ARASearchSpace":
+        pairs = [
+            (
+                "start_layer_index",
+                self.start_layer_index_min,
+                self.start_layer_index_max,
+            ),
+            ("end_layer_index", self.end_layer_index_min, self.end_layer_index_max),
+            (
+                "preserve_good_behavior_weight",
+                self.preserve_good_behavior_weight_min,
+                self.preserve_good_behavior_weight_max,
+            ),
+            (
+                "overcorrect_relative_weight",
+                self.overcorrect_relative_weight_min,
+                self.overcorrect_relative_weight_max,
+            ),
+            ("neighbor_count", self.neighbor_count_min, self.neighbor_count_max),
+        ]
+        for name, low, high in pairs:
+            if low is not None and high is not None and high < low:
+                raise ValueError(f"{name}_max must be >= {name}_min.")
+        return self
+
+    def layer_bounds(self, layer_count: int) -> tuple[int, int, int, int]:
+        """
+        (start_min, start_max, end_min, end_max) for a model with `layer_count`
+        layers, with unset bounds filled from the defaults and everything
+        clamped to the model so a bound written for a bigger model cannot
+        produce an empty or inverted range.
+        """
+        half = layer_count // 2
+
+        def resolve(value: int | None, default: int) -> int:
+            return min(default if value is None else value, layer_count)
+
+        start_min = resolve(self.start_layer_index_min, 0)
+        start_max = max(resolve(self.start_layer_index_max, half), start_min)
+        end_min = resolve(self.end_layer_index_min, half)
+        end_max = max(resolve(self.end_layer_index_max, layer_count), end_min)
+        return start_min, start_max, end_min, end_max
+
+
 # Component names that the model backends know how to discover and abliterate.
 # Both backends map architecture-specific module names onto these keys (e.g.
 # expert down projections -> "mlp.down_proj"), so they are the complete
@@ -555,6 +658,17 @@ class Settings(BaseSettings):
                 "steer_bad_behavior_weight_min."
             )
         return self
+
+    ara_search_space: ARASearchSpace = Field(
+        default_factory=ARASearchSpace,
+        description=(
+            "Search ranges for the ARA inner-objective parameters sampled by the "
+            "outer optimizer (layer indices, preserve_good_behavior_weight, "
+            "overcorrect_relative_weight, neighbor_count). Narrow them to focus a "
+            "study on a known region. The steer_bad_behavior_weight range is set "
+            "separately above."
+        ),
+    )
 
     invert_target: bool = Field(
         default=False,

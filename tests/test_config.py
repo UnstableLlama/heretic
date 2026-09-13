@@ -6,7 +6,7 @@ import unittest
 from isolated_settings import IsolatedSettings
 from pydantic import ValidationError
 
-from heretic.config import ScorerConfig
+from heretic.config import ARASearchSpace, ScorerConfig
 
 
 class ScorerConfigTests(unittest.TestCase):
@@ -90,6 +90,52 @@ class TargetComponentsTests(unittest.TestCase):
     def test_rejects_empty_list(self) -> None:
         with self.assertRaisesRegex(ValidationError, "at least one component"):
             IsolatedSettings(**{"model": "test-model", "target_components": []})
+
+
+class ARASearchSpaceTests(unittest.TestCase):
+    def test_defaults_match_the_original_ranges(self) -> None:
+        space = ARASearchSpace()
+
+        self.assertEqual(space.layer_bounds(64), (0, 32, 32, 64))
+        self.assertEqual(
+            (
+                space.preserve_good_behavior_weight_min,
+                space.preserve_good_behavior_weight_max,
+            ),
+            (0.0, 1.0),
+        )
+        self.assertEqual(
+            (
+                space.overcorrect_relative_weight_min,
+                space.overcorrect_relative_weight_max,
+            ),
+            (0.0, 1.3),
+        )
+        self.assertEqual((space.neighbor_count_min, space.neighbor_count_max), (1, 15))
+
+    def test_layer_bounds_use_explicit_values_and_clamp_to_the_model(self) -> None:
+        space = ARASearchSpace(start_layer_index_max=8, end_layer_index_min=56)
+
+        self.assertEqual(space.layer_bounds(64), (0, 8, 56, 64))
+        # Bounds written for a bigger model are clamped and kept ordered.
+        self.assertEqual(space.layer_bounds(32), (0, 8, 32, 32))
+
+    def test_rejects_inverted_range(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "neighbor_count_max must be >="):
+            ARASearchSpace(neighbor_count_min=10, neighbor_count_max=5)
+
+    def test_settings_accept_a_narrowed_space(self) -> None:
+        settings = IsolatedSettings(
+            model="test-model",
+            ara_search_space={
+                "overcorrect_relative_weight_min": 1.0,
+                "overcorrect_relative_weight_max": 1.2,
+            },
+        )
+
+        self.assertEqual(settings.ara_search_space.overcorrect_relative_weight_min, 1.0)
+        self.assertEqual(settings.ara_search_space.overcorrect_relative_weight_max, 1.2)
+        self.assertEqual(settings.ara_search_space.neighbor_count_max, 15)
 
 
 if __name__ == "__main__":

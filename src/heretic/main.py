@@ -657,20 +657,24 @@ def run():
         trial.set_user_attr("index", trial_index)
 
         if settings.use_ara:
+            search_space = settings.ara_search_space
+            start_min, start_max, end_min, end_max = search_space.layer_bounds(
+                len(model.get_layers())
+            )
             start_layer_index = trial.suggest_int(
                 "start_layer_index",
-                0,
-                len(model.get_layers()) // 2,
+                start_min,
+                start_max,
             )
             end_layer_index = trial.suggest_int(
                 "end_layer_index",
-                len(model.get_layers()) // 2,
-                len(model.get_layers()),
+                end_min,
+                end_max,
             )
             preserve_good_behavior_weight = trial.suggest_float(
                 "preserve_good_behavior_weight",
-                0.0,
-                1.0,
+                search_space.preserve_good_behavior_weight_min,
+                search_space.preserve_good_behavior_weight_max,
             )
             steer_bad_behavior_weight = trial.suggest_float(
                 "steer_bad_behavior_weight",
@@ -680,13 +684,13 @@ def run():
             )
             overcorrect_relative_weight = trial.suggest_float(
                 "overcorrect_relative_weight",
-                0.0,
-                1.3,
+                search_space.overcorrect_relative_weight_min,
+                search_space.overcorrect_relative_weight_max,
             )
             neighbor_count = trial.suggest_int(
                 "neighbor_count",
-                1,
-                15,
+                search_space.neighbor_count_min,
+                search_space.neighbor_count_max,
             )
 
             ara_parameters = ARAParameters(

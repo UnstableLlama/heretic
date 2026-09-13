@@ -211,6 +211,24 @@ max_shard_size = "5GB"
 # System prompt to use when prompting the model.
 system_prompt = "You are a helpful assistant."
 
+# Search ranges for the ARA inner-objective parameters sampled by the outer
+# optimizer (the steer_bad_behavior_weight range is set above). Narrow these
+# once you know where the useful region is: a random search over the full
+# space may hit a narrow band only once, while a focused study finds it
+# repeatedly. Layer bounds are indices into the model's layers; leave them
+# unset to use the defaults (start: 0 to half the layers, end: half to all).
+[ara_search_space]
+#start_layer_index_min = 0
+#start_layer_index_max = 32
+#end_layer_index_min = 32
+#end_layer_index_max = 64
+preserve_good_behavior_weight_min = 0.0
+preserve_good_behavior_weight_max = 1.0
+overcorrect_relative_weight_min = 0.0
+overcorrect_relative_weight_max = 1.3
+neighbor_count_min = 1
+neighbor_count_max = 15
+
 # Each "dataset" below can be a Hugging Face dataset ID, a path to a dataset on disk,
 # or a path to a plain text file with one prompt per line (empty lines are ignored).
 # For text files, "column" is ignored and "split" is optional; when given, it selects
