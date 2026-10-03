@@ -2,7 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 from enum import Enum
-from typing import Dict, Literal
+from typing import Any, Dict, Literal
 
 from pydantic import (
     BaseModel,
@@ -319,6 +319,16 @@ class Settings(BaseSettings):
     max_response_length: PositiveInt = Field(
         default=100,
         description="Maximum number of tokens to generate for each response.",
+    )
+
+    chat_template_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Extra keyword arguments forwarded to the tokenizer's "
+            "apply_chat_template when rendering prompts (capture, evaluation, and "
+            "chat). E.g. { enable_thinking = false } to suppress a reasoning "
+            "model's <think> block so evaluation sees the actual response."
+        ),
     )
 
     response_prefix: str | None = Field(

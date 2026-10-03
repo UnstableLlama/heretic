@@ -1171,7 +1171,10 @@ class Exl3Model:
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
-                chats, add_generation_prompt=True, tokenize=False
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                **self.settings.chat_template_kwargs,
             ),
         )
         if self.settings.response_prefix:
@@ -1348,7 +1351,10 @@ class Exl3Model:
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
-                chats, add_generation_prompt=True, tokenize=False
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                **self.settings.chat_template_kwargs,
             ),
         )
         if self.settings.response_prefix:
@@ -1418,7 +1424,10 @@ class Exl3Model:
         chat_prompt = cast(
             str,
             self.tokenizer.apply_chat_template(
-                chat, add_generation_prompt=True, tokenize=False
+                chat,
+                add_generation_prompt=True,
+                tokenize=False,
+                **self.settings.chat_template_kwargs,
             ),
         )
         generator = self._ensure_generator()
