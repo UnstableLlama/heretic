@@ -1,21 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
-import math
-from contextlib import contextmanager, suppress
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, Type, TypeAlias, cast
+from collections.abc import Callable
+from contextlib import suppress
+from typing import Any, TypeAlias, cast
 
-import bitsandbytes as bnb
 import torch
-import torch.linalg as LA
-import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
-from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
-from torch.optim import LBFGS
 from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
@@ -31,41 +24,23 @@ from transformers import (
     TextStreamer,
 )
 from transformers.generation import (
-    GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
+    GenerateDecoderOnlyOutput,
 )
 
-from .config import QuantizationMethod, RowNormalization, Settings
+from .config import QuantizationMethod, Settings
 from .system import empty_cache
-from .utils import Prompt, batchify, format_exception, mean_distances_to_knn, print
+from .utils import Prompt, batchify, format_exception, print
 
 
 def get_model_class(
     model: str,
-) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
+) -> type[AutoModelForImageTextToText] | type[AutoModelForCausalLM]:
     configs = PretrainedConfig.get_config_dict(model)
 
-    if any([("vision_config" in config) for config in configs]):
+    if any(("vision_config" in config) for config in configs):
         return AutoModelForImageTextToText
     else:
         return AutoModelForCausalLM
-
-
-@dataclass
-class AbliterationParameters:
-    max_weight: float
-    max_weight_position: float
-    min_weight: float
-    min_weight_distance: float
-
-
-@dataclass
-class ARAParameters:
-    start_layer_index: int
-    end_layer_index: int
-    preserve_good_behavior_weight: float
-    steer_bad_behavior_weight: float
-    overcorrect_relative_weight: float
-    neighbor_count: int
 
 
 # The list contains one element per layer.
@@ -74,33 +49,6 @@ class ARAParameters:
 # tensors of shape (prompt, component).
 ModuleIO: TypeAlias = list[dict[str, dict[int, tuple[Tensor, Tensor]]]]
 
-
-@contextmanager
-def _temporarily_hide_local_adapter_files(model_path: str):
-    """Prevent PEFT auto-loading when a local base-model directory also contains
-    adapter artifacts (e.g. adapter_config.json).
-
-    Transformers + PEFT may auto-wrap such directories as PeftModel, which then
-    collides with Heretic's own LoRA attachment flow.
-    """
-    path = Path(model_path).expanduser()
-    if not path.is_dir():
-        yield
-        return
-
-    renamed: list[tuple[Path, Path]] = []
-    try:
-        for name in ("adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"):
-            src = path / name
-            if src.exists():
-                dst = path / f".{name}.heretic-hidden"
-                src.rename(dst)
-                renamed.append((dst, src))
-        yield
-    finally:
-        for src, dst in reversed(renamed):
-            if src.exists() and not dst.exists():
-                src.rename(dst)
 
 class Model:
     model: PreTrainedModel | PeftModel
@@ -121,9 +69,14 @@ class Model:
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.model,
-            **self.revision_kwargs,
+        # PreTrainedTokenizerBase is the "base class for all tokenizer backends"
+        # according to the documentation.
+        self.tokenizer = cast(
+            PreTrainedTokenizerBase,
+            AutoTokenizer.from_pretrained(
+                settings.model,
+                **self.revision_kwargs,
+            ),
         )
 
         # Multimodal models have a processor we'll want to save.
@@ -143,7 +96,7 @@ class Model:
         #           after the prompt and thinks the sequence is complete.
         self.tokenizer.padding_side = "left"
 
-        self.model = None  # ty:ignore[invalid-assignment]
+        self.model = None
         self.max_memory = (
             {int(k) if k.isdigit() else k: v for k, v in settings.max_memory.items()}
             if settings.max_memory
@@ -164,18 +117,17 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                with _temporarily_hide_local_adapter_files(settings.model):
-                    self.model = get_model_class(settings.model).from_pretrained(
-                        settings.model,
-                        dtype=dtype,
-                        device_map=settings.device_map,
-                        max_memory=self.max_memory,
-                        trust_remote_code=True
-                        if settings.model in self.trusted_models
-                        else None,
-                        **self.revision_kwargs,
-                        **extra_kwargs,
-                    )
+                self.model = get_model_class(settings.model).from_pretrained(
+                    settings.model,
+                    dtype=dtype,
+                    device_map=settings.device_map,
+                    max_memory=self.max_memory,
+                    trust_remote_code=True
+                    if settings.model in self.trusted_models
+                    else None,
+                    **self.revision_kwargs,
+                    **extra_kwargs,
+                )
 
                 self.dtype = self.model.dtype
 
@@ -197,7 +149,7 @@ class Model:
                     max_new_tokens=1,
                 )
             except Exception as error:
-                self.model = None  # ty:ignore[invalid-assignment]
+                self.model = None
                 empty_cache()
 
                 formatted = format_exception(error)
@@ -216,12 +168,6 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        if not settings.use_ara or settings.use_ara_lora:
-            self._apply_lora()
-
-        # LoRA B matrices are initialized to zero by default in PEFT,
-        # so we don't need to do anything manually.
-
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
 
         all_components = {}
@@ -235,7 +181,7 @@ class Model:
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
 
-    def _apply_lora(self):
+    def apply_lora(self, lora_rank: int):
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
 
@@ -260,15 +206,6 @@ class Model:
 
         target_modules = sorted(target_modules_set)
 
-        if self.settings.use_ara_lora:
-            lora_rank = self.settings.ara_lora_rank
-        elif self.settings.row_normalization != RowNormalization.FULL:
-            # Rank 1 is sufficient for directional ablation without renormalization.
-            lora_rank = 1
-        else:
-            # Row magnitude preservation introduces nonlinear effects.
-            lora_rank = self.settings.full_normalization_lora_rank
-
         self.peft_config = LoraConfig(
             r=lora_rank,
             target_modules=target_modules,
@@ -283,11 +220,6 @@ class Model:
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
-
-        display_targets = sorted({name.rsplit(".", 1)[-1] for name in target_modules})
-        print(
-            f"* LoRA adapters initialized (target types: {', '.join(display_targets)})"
-        )
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
@@ -331,16 +263,15 @@ class Model:
 
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
-            with _temporarily_hide_local_adapter_files(self.settings.model):
-                base_model = get_model_class(self.settings.model).from_pretrained(
-                    self.settings.model,
-                    torch_dtype=self.model.dtype,
-                    device_map="cpu",
-                    trust_remote_code=True
-                    if self.settings.model in self.trusted_models
-                    else None,
-                    **self.revision_kwargs,
-                )
+            base_model = get_model_class(self.settings.model).from_pretrained(
+                self.settings.model,
+                torch_dtype=self.model.dtype,
+                device_map="cpu",
+                trust_remote_code=True
+                if self.settings.model in self.trusted_models
+                else None,
+                **self.revision_kwargs,
+            )
 
             # Apply LoRA adapters to the CPU model
             print("* Applying LoRA adapters...")
@@ -364,7 +295,7 @@ class Model:
             self.needs_reload = True
             return merged_model
 
-    def reset_model(self):
+    def reset_model(self) -> bool:
         """
         Resets the model to a clean state for the next trial or evaluation.
 
@@ -373,6 +304,8 @@ class Model:
           resets LoRA adapter weights to zero (identity transformation).
         - Slow path: If switching models or after merge_and_unload(),
           performs full model reload with quantization config.
+
+        Returns True if the fast path was taken.
         """
 
         # If a prior model load was interrupted/cancelled mid-process, self.model will be None.
@@ -380,19 +313,15 @@ class Model:
         if self.model is not None:
             current_model = getattr(self.model.config, "name_or_path", None)
 
-        if (
-            current_model == self.settings.model
-            and not self.needs_reload
-            and (not self.settings.use_ara or self.settings.use_ara_lora)
-        ):
+        if current_model == self.settings.model and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation).
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
                     torch.nn.init.zeros_(module.weight)
-            return
+            return True
 
         # Purge existing model object from memory to make space.
-        self.model = None  # ty:ignore[invalid-assignment]
+        self.model = None
         empty_cache()
 
         quantization_config = self._get_quantization_config(
@@ -404,23 +333,21 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        with _temporarily_hide_local_adapter_files(self.settings.model):
-            self.model = get_model_class(self.settings.model).from_pretrained(
-                self.settings.model,
-                dtype=self.dtype,
-                device_map=self.settings.device_map,
-                max_memory=self.max_memory,
-                trust_remote_code=True
-                if self.settings.model in self.trusted_models
-                else None,
-                **self.revision_kwargs,
-                **extra_kwargs,
-            )
-
-        if not self.settings.use_ara or self.settings.use_ara_lora:
-            self._apply_lora()
+        self.model = get_model_class(self.settings.model).from_pretrained(
+            self.settings.model,
+            dtype=self.dtype,
+            device_map=self.settings.device_map,
+            max_memory=self.max_memory,
+            trust_remote_code=True
+            if self.settings.model in self.trusted_models
+            else None,
+            **self.revision_kwargs,
+            **extra_kwargs,
+        )
 
         self.needs_reload = False
+
+        return False
 
     def get_layers(self) -> ModuleList:
         model = self.model
@@ -431,10 +358,10 @@ class Model:
 
         # Most multimodal models.
         with suppress(Exception):
-            return model.model.language_model.layers
+            return model.model.language_model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
         # Text-only models.
-        return model.model.layers
+        return model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
@@ -455,50 +382,50 @@ class Model:
 
         # Standard self-attention out-projection (most models).
         with suppress(Exception):
-            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty: ignore[unresolved-attribute]
 
         # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead of
         # standard self-attention, so self_attn.o_proj doesn't exist on those layers.
         with suppress(Exception):
-            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty: ignore[unresolved-attribute]
 
         # Most dense models.
         with suppress(Exception):
-            try_add("mlp.down_proj", layer.mlp.down_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("mlp.down_proj", layer.mlp.down_proj)  # ty: ignore[unresolved-attribute]
 
         # Some MoE models (e.g. Qwen3).
         with suppress(Exception):
-            for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+            for expert in layer.mlp.experts:  # ty:ignore[not-iterable, unresolved-attribute]
+                try_add("mlp.down_proj", expert.down_proj)  # ty: ignore[unresolved-attribute]
 
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
-            for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
+            for expert in layer.block_sparse_moe.experts:  # ty:ignore[not-iterable, unresolved-attribute]
+                try_add("mlp.down_proj", expert.w2)  # ty: ignore[unresolved-attribute]
 
         # LFM dense operator blocks.
         with suppress(Exception):
-            try_add("attn.o_proj", layer.conv.out_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("attn.o_proj", layer.conv.out_proj)  # ty: ignore[unresolved-attribute]
 
         with suppress(Exception):
-            try_add("mlp.down_proj", layer.feed_forward.w2)  # ty:ignore[possibly-missing-attribute]
+            try_add("mlp.down_proj", layer.feed_forward.w2)  # ty: ignore[unresolved-attribute]
 
         # LFM transformer blocks.
         with suppress(Exception):
-            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty: ignore[unresolved-attribute]
 
         with suppress(Exception):
-            for expert in layer.feed_forward.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
+            for expert in layer.feed_forward.experts:  # ty:ignore[not-iterable, unresolved-attribute]
+                try_add("mlp.down_proj", expert.w2)  # ty: ignore[unresolved-attribute]
 
         # Granite MoE Hybrid - attention layers with shared_mlp.
         with suppress(Exception):
-            try_add("mlp.down_proj", layer.shared_mlp.output_linear)  # ty:ignore[possibly-missing-attribute]
+            try_add("mlp.down_proj", layer.shared_mlp.output_linear)  # ty: ignore[unresolved-attribute]
 
         # Granite MoE Hybrid - MoE layers with experts.
         with suppress(Exception):
-            for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
+            for expert in layer.moe.experts:  # ty:ignore[not-iterable, unresolved-attribute]
+                try_add("mlp.down_proj", expert.output_linear)  # ty: ignore[unresolved-attribute]
 
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
@@ -515,450 +442,6 @@ class Model:
             components.update(self.get_layer_modules(layer_index).keys())
 
         return sorted(components)
-
-    def abliterate(
-        self,
-        residual_directions: Tensor,
-        direction_index: float | None,
-        parameters: dict[str, AbliterationParameters],
-    ):
-        if direction_index is None:
-            residual_direction = None
-        else:
-            # The index must be shifted by 1 because the first element
-            # of residual_directions is the direction for the embeddings.
-            weight, index = math.modf(direction_index + 1)
-            residual_direction = F.normalize(
-                residual_directions[int(index)].lerp(
-                    residual_directions[int(index) + 1],
-                    weight,
-                ),
-                p=2,
-                dim=0,
-            )
-
-        # Note that some implementations of abliteration also orthogonalize
-        # the embedding matrix, but it's unclear if that has any benefits.
-        for layer_index in range(len(self.get_layers())):
-            for component, modules in self.get_layer_modules(layer_index).items():
-                params = parameters[component]
-
-                # Type inference fails here for some reason.
-                distance = cast(float, abs(layer_index - params.max_weight_position))
-
-                # Don't orthogonalize layers that are more than
-                # min_weight_distance away from max_weight_position.
-                if distance > params.min_weight_distance:
-                    continue
-
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
-                weight = params.max_weight + (distance / params.min_weight_distance) * (
-                    params.min_weight - params.max_weight
-                )
-
-                # A weight of 0 disables this component's ablation. reset_model() has
-                # already left the adapter at identity, so abort before the otherwise
-                # wasteful decomposition (which would also be operating on a zero matrix).
-                if weight == 0:
-                    continue
-
-                if residual_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of residual_directions is the direction for the embeddings.
-                    layer_residual_direction = residual_directions[layer_index + 1]
-                else:
-                    layer_residual_direction = residual_direction
-
-                for module in modules:
-                    # FIXME: This cast is potentially invalid, because the program logic
-                    #        does not guarantee that the module is of type Linear, and in fact
-                    #        the retrieved modules might not conform to the interface assumed
-                    #        below (though they do in practice). However, this is difficult
-                    #        to fix cleanly, because get_layer_modules is called twice on
-                    #        different model configurations, and PEFT employs different
-                    #        module types depending on the chosen quantization.
-                    module = cast(Linear, module)
-
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
-
-                    # Use the FP32 residual direction directly (no downcast/upcast)
-                    # and move to the correct device.
-                    v = layer_residual_direction.to(module.weight.device)
-
-                    # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
-                        W = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
-
-                    # Flatten weight matrix to (out_features, in_features).
-                    W = W.view(W.shape[0], -1)
-
-                    if self.settings.row_normalization == RowNormalization.FULL:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
-                        W_org = W
-
-                    if self.settings.row_normalization != RowNormalization.NONE:
-                        # Get the row norms.
-                        W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
-                        # Normalize the weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
-
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
-
-                    if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
-                        lora_B = W_row_norms * lora_B
-                    elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                        W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
-                        W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
-                        W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
-                        r = self.peft_config.r
-
-                        # svd_lowrank is randomized:
-                        # https://github.com/pytorch/pytorch/blob/20919052303c0b5ba87f8bf7e19237dc33ab09d3/torch/_lowrank.py#L108-L109
-                        # Reseed immediately before the call so restoring a trial is independent of RNG history.
-                        torch.manual_seed(self.settings.seed)
-                        # "It's safe to call this function if CUDA is not available;
-                        # in that case, it is silently ignored."
-                        torch.cuda.manual_seed_all(self.settings.seed)  # ty:ignore[invalid-argument-type]
-                        U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components. Split the singular values
-                        # evenly between the two components to keep their norms balanced and avoid
-                        # potential issues with numerical stability.
-                        sqrt_S = torch.sqrt(S)
-                        lora_B = U @ torch.diag(sqrt_S)
-                        lora_A = torch.diag(sqrt_S) @ Vh
-
-                    # Assign to adapters. The adapter name is "default", because that's
-                    # what PEFT uses when no name is explicitly specified, as above.
-                    # These casts are therefore valid.
-                    weight_A = cast(Tensor, module.lora_A["default"].weight)
-                    weight_B = cast(Tensor, module.lora_B["default"].weight)
-                    weight_A.data = lora_A.to(weight_A.dtype)
-                    weight_B.data = lora_B.to(weight_B.dtype)
-
-    def ara_abliterate(
-        self,
-        good_module_io: ModuleIO,
-        bad_module_io: ModuleIO,
-        parameters: ARAParameters,
-    ):
-        for layer_index in range(
-            parameters.start_layer_index,
-            parameters.end_layer_index,
-        ):
-            for component, modules in self.get_layer_modules(layer_index).items():
-                for module_index, module in enumerate(modules):
-                    module = cast(Linear, module)
-                    matrix = module.weight
-
-                    row_norms = LA.vector_norm(matrix, dim=1, keepdim=True).detach()
-
-                    def get_matrix() -> Tensor:
-                        if self.settings.row_normalization == RowNormalization.FULL:
-                            return row_norms * F.normalize(matrix, p=2, dim=1)
-                        else:
-                            return matrix
-
-                    good_input, good_output = good_module_io[layer_index][component][
-                        module_index
-                    ]
-                    bad_input, bad_output = bad_module_io[layer_index][component][
-                        module_index
-                    ]
-
-                    good_input = good_input.to(matrix.device)
-                    good_output = good_output.to(matrix.device)
-                    bad_input = bad_input.to(matrix.device)
-                    bad_output = bad_output.to(matrix.device)
-
-                    def objective(matrix: Tensor) -> Tensor:
-                        new_good_output = good_input @ matrix.T
-                        new_bad_output = bad_input @ matrix.T
-
-                        preserve_good_behavior = (
-                            (new_good_output - good_output) ** 2
-                        ).mean()
-
-                        steer_bad_behavior = (
-                            mean_distances_to_knn(
-                                new_bad_output,
-                                good_output,
-                                parameters.neighbor_count,
-                            ).mean()
-                            + parameters.overcorrect_relative_weight
-                            * -mean_distances_to_knn(
-                                new_bad_output,
-                                bad_output,
-                                parameters.neighbor_count,
-                            ).mean()
-                        )
-                        if self.settings.invert_target:
-                            steer_bad_behavior = -steer_bad_behavior
-
-                        return (
-                            parameters.preserve_good_behavior_weight
-                            * preserve_good_behavior
-                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
-                        )
-
-                    optimizer = LBFGS(
-                        [matrix],
-                        lr=1.0,
-                        max_iter=20,
-                        history_size=10,
-                        line_search_fn="strong_wolfe",
-                    )
-
-                    def closure() -> Tensor:
-                        optimizer.zero_grad()
-                        loss = objective(get_matrix())
-                        loss.backward()
-                        return loss
-
-                    for step in range(5):
-                        optimizer.step(closure)
-
-                    with torch.no_grad():
-                        matrix.copy_(get_matrix())
-
-    def ara_lora_abliterate(
-        self,
-        good_module_io: ModuleIO,
-        bad_module_io: ModuleIO,
-        parameters: ARAParameters,
-    ):
-        for layer_index in range(
-            parameters.start_layer_index,
-            parameters.end_layer_index,
-        ):
-            for component, modules in self.get_layer_modules(layer_index).items():
-                for module_index, module in enumerate(modules):
-                    module = cast(Linear, module)
-
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W_base = base_weight.to(torch.float32)
-                    else:
-                        W_base = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
-
-                    W_row_norms = LA.vector_norm(W_base, dim=1, keepdim=True).detach()
-
-                    lora_A = cast(Tensor, module.lora_A["default"].weight)
-                    lora_B = cast(Tensor, module.lora_B["default"].weight)
-
-                    good_input, good_output = good_module_io[layer_index][component][module_index]
-                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
-
-                    good_input = good_input.float().to(lora_A.device)
-                    good_output = good_output.float().to(lora_A.device)
-                    bad_input = bad_input.float().to(lora_A.device)
-                    bad_output = bad_output.float().to(lora_A.device)
-
-                    def objective(A: Tensor, B: Tensor) -> Tensor:
-                        W_eff = W_base + (B @ A)
-
-                        if self.settings.row_normalization == RowNormalization.FULL:
-                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
-
-                        new_good_output = good_input @ W_eff.T
-                        new_bad_output = bad_input @ W_eff.T
-
-                        preserve_good_behavior = (
-                            (new_good_output - good_output) ** 2
-                        ).mean()
-
-                        steer_bad_behavior = (
-                            mean_distances_to_knn(
-                                new_bad_output,
-                                good_output,
-                                parameters.neighbor_count,
-                            ).mean()
-                            + parameters.overcorrect_relative_weight
-                            * -mean_distances_to_knn(
-                                new_bad_output,
-                                bad_output,
-                                parameters.neighbor_count,
-                            ).mean()
-                        )
-                        if self.settings.invert_target:
-                            steer_bad_behavior = -steer_bad_behavior
-
-                        loss = (
-                            parameters.preserve_good_behavior_weight
-                            * preserve_good_behavior
-                            + parameters.steer_bad_behavior_weight * steer_bad_behavior
-                        )
-                        # Optional L2 regularization on the LoRA factors (see
-                        # ara_lora_regularization). Bounds the unbounded
-                        # overcorrection objective and the A@B scale degeneracy.
-                        # Disabled when the strength is 0.
-                        reg = self.settings.ara_lora_regularization
-                        if reg:
-                            loss = loss + reg * (A.pow(2).mean() + B.pow(2).mean())
-                        return loss
-
-                    optimizer = LBFGS(
-                        [lora_A, lora_B],
-                        lr=1.0,
-                        max_iter=20,
-                        history_size=10,
-                        line_search_fn="strong_wolfe",
-                    )
-
-                    def closure():
-                        optimizer.zero_grad()
-                        loss = objective(lora_A, lora_B)
-                        loss.backward()
-                        return loss
-
-                    for step in range(5):
-                        optimizer.step(closure)
-
-    def get_module_io(
-        self,
-        prompts: list[Prompt],
-    ) -> ModuleIO:
-        module_io: ModuleIO = []
-
-        def get_hook(
-            layer_index: int,
-            component: str,
-            module_index: int,
-        ) -> Callable[[Module, tuple[Tensor, ...], Tensor], None]:
-            def hook(
-                module: Module,
-                inputs: tuple[Tensor, ...],
-                outputs: Tensor,
-            ) -> None:
-                if len(module_io) == layer_index:
-                    module_io.append({})
-
-                assert len(module_io) == layer_index + 1
-
-                if component not in module_io[layer_index]:
-                    module_io[layer_index][component] = {}
-
-                assert module_index not in module_io[layer_index][component]
-
-                input = inputs[0][:, -1, :].detach().clone().cpu()
-                output = outputs[:, -1, :].detach().clone().cpu()
-
-                module_io[layer_index][component][module_index] = (input, output)
-
-            return hook
-
-        hook_handles: list[RemovableHandle] = []
-
-        for layer_index in range(len(self.get_layers())):
-            for component, modules in self.get_layer_modules(layer_index).items():
-                for module_index, module in enumerate(modules):
-                    hook_handles.append(
-                        module.register_forward_hook(
-                            get_hook(layer_index, component, module_index)
-                        )
-                    )
-
-        self.generate(prompts, max_new_tokens=1)
-
-        for hook_handle in hook_handles:
-            hook_handle.remove()
-
-        return module_io
-
-    def get_module_io_batched(
-        self,
-        prompts: list[Prompt],
-    ) -> ModuleIO:
-        module_io_batches: list[ModuleIO] = [
-            self.get_module_io(batch)
-            for batch in batchify(prompts, self.settings.batch_size)
-        ]
-
-        module_io: ModuleIO = []
-
-        for layer_index in range(len(self.get_layers())):
-            module_io.append({})
-
-            for module_io_batch in module_io_batches:
-                for component, io_map in module_io_batch[layer_index].items():
-                    if component not in module_io[layer_index]:
-                        module_io[layer_index][component] = {}
-
-                    for module_index in io_map:
-                        if module_index not in module_io[layer_index][component]:
-                            module_io[layer_index][component][module_index] = (
-                                torch.empty(0),
-                                torch.empty(0),
-                            )
-
-            for component, io_map in module_io[layer_index].items():
-                for module_index in io_map:
-                    inputs_outputs = [
-                        module_io_batch[layer_index][component][module_index]
-                        for module_io_batch in module_io_batches
-                        if component in module_io_batch[layer_index]
-                        and module_index in module_io_batch[layer_index][component]
-                    ]
-                    input = torch.cat(
-                        [input_output[0] for input_output in inputs_outputs],
-                        dim=0,
-                    )
-                    output = torch.cat(
-                        [input_output[1] for input_output in inputs_outputs],
-                        dim=0,
-                    )
-
-                    module_io[layer_index][component][module_index] = (input, output)
-
-        return module_io
 
     def generate(
         self,
@@ -981,6 +464,7 @@ class Model:
                 chats,
                 add_generation_prompt=True,
                 tokenize=False,
+                **self.settings.chat_template_kwargs,
             ),
         )
 
@@ -1033,16 +517,22 @@ class Model:
         skip_special_tokens: bool = False,
     ) -> list[str]:
         responses = []
+
         for batch in batchify(prompts, self.settings.batch_size):
-            for response in self.get_responses(
-                batch,
-                skip_special_tokens=skip_special_tokens,
-            ):
-                responses.append(response)
+            responses.extend(
+                self.get_responses(
+                    batch,
+                    skip_special_tokens=skip_special_tokens,
+                )
+            )
 
         return responses
 
-    def get_residuals(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals(
+        self,
+        prompts: list[Prompt],
+        winsorization_quantile: float = 1.0,
+    ) -> Tensor:
         # We only generate one token, and we return the residual vectors
         # at that token position, for each prompt and layer.
         _, outputs = self.generate(
@@ -1076,13 +566,13 @@ class Model:
         # problems during calculations involving residual vectors.
         residuals = residuals.to(torch.float32)
 
-        if 0 <= self.settings.winsorization_quantile < 1:
+        if 0 <= winsorization_quantile < 1:
             # Apply symmetric winsorization to each layer of the per-prompt residuals.
             abs_residuals = torch.abs(residuals)
             # Get the (prompt, layer, 1) quantiles of the (prompt, layer, component) residuals.
             thresholds = torch.quantile(
                 abs_residuals,
-                self.settings.winsorization_quantile,
+                winsorization_quantile,
                 dim=2,
                 keepdim=True,
             )
@@ -1094,15 +584,28 @@ class Model:
 
         return residuals
 
-    def get_residuals_batched(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals_batched(
+        self,
+        prompts: list[Prompt],
+        winsorization_quantile: float = 1.0,
+    ) -> Tensor:
         residuals = []
 
         for batch in batchify(prompts, self.settings.batch_size):
-            residuals.append(self.get_residuals(batch))
+            residuals.append(
+                self.get_residuals(
+                    batch,
+                    winsorization_quantile=winsorization_quantile,
+                )
+            )
 
         return torch.cat(residuals, dim=0)
 
-    def get_residuals_mean(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals_mean(
+        self,
+        prompts: list[Prompt],
+        winsorization_quantile: float = 1.0,
+    ) -> Tensor:
         if not prompts:
             raise ValueError("prompts must not be empty")
 
@@ -1110,7 +613,10 @@ class Model:
         total_count = 0
 
         for batch in batchify(prompts, self.settings.batch_size):
-            batch_residuals = self.get_residuals(batch)
+            batch_residuals = self.get_residuals(
+                batch,
+                winsorization_quantile=winsorization_quantile,
+            )
 
             # Accumulate in high precision on CPU to reduce peak VRAM usage.
             batch_sum = batch_residuals.sum(dim=0, dtype=torch.float64).cpu()
@@ -1125,6 +631,132 @@ class Model:
         assert running_sum is not None
 
         return (running_sum / total_count).to(torch.float32)
+
+    def get_module_io(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        # The list contains one element per layer.
+        # Each element maps from the component name to a (possibly sparse) mapping
+        # from the module index to an (input, output) tuple containing the I/O
+        # tensors of shape (prompt, component).
+        module_io: ModuleIO = []
+
+        def get_hook(
+            layer_index: int,
+            component: str,
+            module_index: int,
+        ) -> Callable[[Module, tuple[Tensor, ...], Tensor], None]:
+            def hook(
+                module: Module,
+                inputs: tuple[Tensor, ...],
+                outputs: Tensor,
+            ) -> None:
+                if len(module_io) == layer_index:
+                    # First invocation of the hook for this layer.
+                    module_io.append({})
+
+                # Layers are invoked in order during inference,
+                # so this should always hold.
+                assert len(module_io) == layer_index + 1
+
+                if component not in module_io[layer_index]:
+                    module_io[layer_index][component] = {}
+
+                # Each module should be invoked at most once per inference step.
+                assert module_index not in module_io[layer_index][component]
+
+                # inputs[0] and outputs have shape (prompt, position, component),
+                # so this extracts the input/output at the end of each prompt.
+                # Move to CPU to decouple from device assignments, which can
+                # change between model reloads in multi-GPU configurations.
+                input = inputs[0][:, -1, :].detach().clone().cpu()
+                output = outputs[:, -1, :].detach().clone().cpu()
+
+                # The modules associated with a component (e.g. expert MLPs)
+                # are not necessarily invoked in order, nor are all of them
+                # necessarily invoked in each inference step, so we cannot
+                # use a list here.
+                module_io[layer_index][component][module_index] = (input, output)
+
+            return hook
+
+        hook_handles: list[RemovableHandle] = []
+
+        for layer_index in range(len(self.get_layers())):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    hook_handles.append(
+                        module.register_forward_hook(
+                            get_hook(layer_index, component, module_index)
+                        )
+                    )
+
+        self.generate(prompts, max_new_tokens=1)
+
+        for hook_handle in hook_handles:
+            hook_handle.remove()
+
+        return module_io
+
+    def get_module_io_batched(
+        self,
+        prompts: list[Prompt],
+    ) -> ModuleIO:
+        # Aggregating batch results is more complicated for module I/O
+        # than for other get_*_batched methods, because the structure of the results
+        # might differ between batches, as whether individual modules activate
+        # can depend on the prompt (in particular for MoE models).
+        # In practice, inhomogeneous results should be very rare, but to be fully
+        # generic, this logic is required.
+        module_io_batches: list[ModuleIO] = [
+            self.get_module_io(batch)
+            for batch in batchify(prompts, self.settings.batch_size)
+        ]
+
+        module_io: ModuleIO = []
+
+        for layer_index in range(len(self.get_layers())):
+            module_io.append({})
+
+            for module_io_batch in module_io_batches:
+                for component, io_map in module_io_batch[layer_index].items():
+                    if component not in module_io[layer_index]:
+                        module_io[layer_index][component] = {}
+
+                    for module_index in io_map:
+                        if module_index not in module_io[layer_index][component]:
+                            # This is a placeholder; the actual aggregation happens below.
+                            # We need to iterate over the batches twice because we don't
+                            # know in advance which components and module indices are present.
+                            module_io[layer_index][component][module_index] = (
+                                torch.empty(0),
+                                torch.empty(0),
+                            )
+
+            for component, io_map in module_io[layer_index].items():
+                for module_index in io_map:
+                    inputs_outputs = [
+                        module_io_batch[layer_index][component][module_index]
+                        for module_io_batch in module_io_batches
+                        if component in module_io_batch[layer_index]
+                        and module_index in module_io_batch[layer_index][component]
+                    ]
+                    input = torch.cat(
+                        [input_output[0] for input_output in inputs_outputs],
+                        dim=0,
+                    )
+                    output = torch.cat(
+                        [input_output[1] for input_output in inputs_outputs],
+                        dim=0,
+                    )
+
+                    # The key already exists, and replacing existing values
+                    # in a dictionary while iterating over the same dictionary
+                    # is safe in Python.
+                    module_io[layer_index][component][module_index] = (input, output)
+
+        return module_io
 
     def get_logits(self, prompts: list[Prompt]) -> Tensor:
         # We only generate one token, and we return the raw logits over the vocabulary
@@ -1172,6 +804,7 @@ class Model:
                 chat,
                 add_generation_prompt=True,
                 tokenize=False,
+                **self.settings.chat_template_kwargs,
             ),
         )
 
@@ -1185,7 +818,7 @@ class Model:
             # The TextStreamer constructor annotates this parameter with the AutoTokenizer
             # type, which makes no sense because AutoTokenizer is a factory class,
             # not a base class that tokenizers inherit from.
-            self.tokenizer,  # ty:ignore[invalid-argument-type]
+            self.tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
         )

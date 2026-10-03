@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+from copy import deepcopy
 from enum import Enum
-from typing import Any, Dict, Literal
+from typing import Any, Literal, TypeAlias
 
 from pydantic import (
     BaseModel,
     Field,
     NonNegativeInt,
     PositiveInt,
+    TypeAdapter,
     field_validator,
     model_validator,
 )
@@ -34,19 +36,12 @@ class QuantizationMethod(str, Enum):
     EXL3 = "exl3"
 
 
-class RowNormalization(str, Enum):
-    NONE = "none"
-    PRE = "pre"
-    # POST = "post"  # Theoretically possible, but provides no advantage.
-    FULL = "full"
-
-
 class ExportStrategy(str, Enum):
     MERGE = "merge"
     ADAPTER = "adapter"
 
 
-class DatasetSpecification(BaseModel):
+class SingleDatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
     )
@@ -54,6 +49,14 @@ class DatasetSpecification(BaseModel):
     commit: str | None = Field(
         default=None,
         description="Hugging Face commit hash of the dataset.",
+    )
+
+    config: str | None = Field(
+        default=None,
+        description=(
+            "Dataset config/subset name. Each config can have its own split. "
+            "Used to load a specific config of a dataset that has multiple configurations."
+        ),
     )
 
     split: str | None = Field(
@@ -81,17 +84,10 @@ class DatasetSpecification(BaseModel):
         description="System prompt to use with the prompts (overrides global system prompt if set).",
     )
 
-    residual_plot_label: str | None = Field(
-        default=None,
-        description="Label to use for the dataset in plots of residual vectors.",
-        exclude=True,
-    )
 
-    residual_plot_color: str | None = Field(
-        default=None,
-        description="Matplotlib color to use for the dataset in plots of residual vectors.",
-        exclude=True,
-    )
+DatasetSpecification: TypeAlias = (
+    SingleDatasetSpecification | list[SingleDatasetSpecification]
+)
 
 
 class ScorerConfig(BaseModel):
@@ -144,6 +140,48 @@ class ScorerConfig(BaseModel):
         return value
 
 
+class ModifierConfig(BaseModel):
+    """
+    Configuration for a modifier plugin.
+
+    TOML format:
+    - { plugin = "<plugin>", instance_name = "<optional>" }
+    """
+
+    plugin: str = Field(
+        description=(
+            "Plugin to load. Either a file path with class name "
+            "(`path/to/plugin.py:ClassName`) or a fully-qualified import path "
+            "(`module.submodule.ClassName`)."
+        ),
+    )
+
+    instance_name: str | None = Field(
+        default=None,
+        description=(
+            "Optional name to distinguish multiple instances of the same plugin class. "
+            "Instance-specific settings live under `[modifier.<ClassName>_<instance_name>]`."
+        ),
+    )
+
+    @field_validator("instance_name")
+    @classmethod
+    def validate_instance_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+
+        if not value.strip():
+            raise ValueError("cannot be empty or whitespace")
+
+        if "." in value:
+            raise ValueError("'.' is not allowed")
+
+        if any(char.isspace() for char in value):
+            raise ValueError("whitespace is not allowed")
+
+        return value
+
+
 class BenchmarkSpecification(BaseModel):
     task: str = Field(
         description="Task ID of the benchmark in the Language Model Evaluation Harness."
@@ -158,7 +196,6 @@ class BenchmarkSpecification(BaseModel):
 
 class Settings(BaseSettings):
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
-
 
     exl3_max_num_tokens: int = Field(
         default=8192,
@@ -195,7 +232,7 @@ class Settings(BaseSettings):
         default=None,
         description=(
             "EXL3 backend only: explicit per-device memory budget in GB used to "
-            'split the model across GPUs (e.g. [20.0, 20.0]). If not set, '
+            "split the model across GPUs (e.g. [20.0, 20.0]). If not set, "
             "exllamav3 auto-splits across all visible devices."
         ),
     )
@@ -283,12 +320,12 @@ class Settings(BaseSettings):
         ),
     )
 
-    device_map: str | Dict[str, int | str] = Field(
+    device_map: str | dict[str, int | str] = Field(
         default="auto",
         description="Device map to pass to Accelerate when loading the model.",
     )
 
-    max_memory: Dict[str, str] | None = Field(
+    max_memory: dict[str, str] | None = Field(
         default=None,
         description='Maximum memory to allocate per device (e.g., { "0" = "20GB", "cpu" = "64GB" }).',
     )
@@ -316,12 +353,24 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    batch_size_test_prompts: DatasetSpecification = Field(
+        default=SingleDatasetSpecification(
+            dataset="mlabonne/harmless_alpaca",
+            split="train[:256]",
+            column="text",
+        ),
+        description="Dataset of prompts to use for automatically determining the optimal batch size.",
+        # When storing a settings object, the batch size is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
+    )
+
     max_response_length: PositiveInt = Field(
         default=100,
         description="Maximum number of tokens to generate for each response.",
     )
 
-    chat_template_kwargs: Dict[str, Any] = Field(
+    chat_template_kwargs: dict[str, Any] = Field(
         default_factory=dict,
         description=(
             "Extra keyword arguments forwarded to the tokenizer's "
@@ -338,6 +387,25 @@ class Settings(BaseSettings):
             "at the point where responses start to differ for different prompts. "
             "If not set, the prefix is determined automatically by comparing multiple responses."
         ),
+    )
+
+    response_prefix_test_prompts: DatasetSpecification = Field(
+        default=[
+            SingleDatasetSpecification(
+                dataset="mlabonne/harmless_alpaca",
+                split="train[:100]",
+                column="text",
+            ),
+            SingleDatasetSpecification(
+                dataset="mlabonne/harmful_behaviors",
+                split="train[:100]",
+                column="text",
+            ),
+        ],
+        description="Dataset of prompts to use for automatically determining the response prefix.",
+        # When storing a settings object, the response prefix is already fixed,
+        # either determined by the automatic mechanism or by explicit user choice.
+        exclude=True,
     )
 
     chain_of_thought_skips: list[tuple[str, str]] = Field(
@@ -379,38 +447,8 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
-    print_residual_geometry: bool = Field(
-        default=False,
-        description="Whether to print detailed information about residuals and residual directions.",
-        exclude=True,
-    )
-
-    plot_residuals: bool = Field(
-        default=False,
-        description="Whether to generate plots showing PaCMAP projections of residual vectors.",
-        exclude=True,
-    )
-
-    residual_plot_path: str = Field(
-        default="plots",
-        description="Base path to save plots of residual vectors to.",
-        exclude=True,
-    )
-
-    residual_plot_title: str = Field(
-        default='PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts',
-        description="Title placed above plots of residual vectors.",
-        exclude=True,
-    )
-
-    residual_plot_style: str = Field(
-        default="dark_background",
-        description="Matplotlib style sheet to use for plots of residual vectors.",
-        exclude=True,
-    )
-
     scorers: list[ScorerConfig] = Field(
-        default_factory=lambda: [
+        default=[
             ScorerConfig(
                 plugin="heretic.scorers.keyword_rate.KeywordRate",
                 optimization="minimize",
@@ -421,176 +459,136 @@ class Settings(BaseSettings):
             ),
         ],
         description=(
-            "List of scorer plugin configs. Each entry is an object"
-            " { plugin = <plugin>, optimization = <optimization>, instance_name = <optional> }."
-            " <optimization> is one of 'minimize', 'maximize', 'none' (do not optimize)."
+            "List of scorer plugin configs. Each entry is an object "
+            "{ plugin = <plugin>, optimization = <optimization>, instance_name = <optional> }. "
+            '<optimization> is one of "minimize", "maximize", or "none" (do not optimize).'
         ),
     )
 
-    use_ara: bool = Field(
-        default=False,
+    modifiers: list[ModifierConfig] = Field(
+        default=[
+            ModifierConfig(
+                plugin="heretic.modifiers.ara.ARA",
+            ),
+        ],
         description=(
-            "Whether to use Arbitrary-Rank Ablation (ARA), an abliteration method based on matrix optimization, "
-            "instead of traditional directional ablation."
+            "List of modifier plugin configs. Each entry is an object "
+            "{ plugin = <plugin>, instance_name = <optional> }. "
+            "Note that only a single modifier can currently be applied, "
+            "and this list must contain exactly one entry."
         ),
     )
 
-    use_ara_lora: bool = Field(
-        default=False,
-        description=(
-            "Use LoRA in ARA instead of full-weight editing. "
-            "Makes ARA compatible with quantization and removes model reloads between trials. "
-            "Based on work by kabachuha (https://github.com/p-e-w/heretic/pull/332)."
-        ),
+    # Legacy CLI flags remain accepted; normalize them into the 2.x plugin schema.
+    use_ara: bool | None = Field(default=None, exclude=True)
+    use_ara_lora: bool | None = Field(default=None, exclude=True)
+    ara_lora_rank: PositiveInt | None = Field(default=None, exclude=True)
+    ara_lora_regularization: float | None = Field(default=None, ge=0, exclude=True)
+    steer_bad_behavior_weight_min: float | None = Field(
+        default=None, gt=0, exclude=True
     )
-
-    ara_lora_rank: int = Field(
-        default=128,
-        description=(
-            "If LoRA is used in ARA, this sets its rank. "
-            "Keep it high enough to simulate the 'arbitrary' effect."
-        ),
+    steer_bad_behavior_weight_max: float | None = Field(
+        default=None, gt=0, exclude=True
     )
-
-    ara_lora_regularization: float = Field(
-        default=0.0,
-        description=(
-            "L2 regularization strength on the ARA LoRA factors A and B "
-            "(adds value * (mean(A^2) + mean(B^2)) to the optimization loss). "
-            "0 (the default) disables it. The ARA overcorrection objective is "
-            "unbounded below and LoRA has a scale degeneracy, so the factors can "
-            "blow up and overflow the fp16 forward (nan KL), especially on "
-            "low-bit quants. A small positive value (e.g. 1e-3) bounds the loss "
-            "and keeps the factors well-scaled; too large weakens abliteration."
-        ),
+    invert_target: bool | None = Field(default=None, exclude=True)
+    row_normalization: Literal["none", "pre", "full"] | None = Field(
+        default=None, exclude=True
     )
+    orthogonalize_direction: bool | None = Field(default=None, exclude=True)
+    full_normalization_lora_rank: PositiveInt | None = Field(default=None, exclude=True)
+    winsorization_quantile: float | None = Field(default=None, exclude=True)
 
-    steer_bad_behavior_weight_min: float = Field(
-        default=0.0001,
-        description=(
-            "Lower bound of the search range for the ARA inner-objective "
-            "'steer_bad_behavior_weight', which the outer optimizer samples on a "
-            "log scale. Applies to both ARA and ARA-LoRA. Must be positive and "
-            "no greater than steer_bad_behavior_weight_max."
-        ),
-    )
-
-    steer_bad_behavior_weight_max: float = Field(
-        default=0.001,
-        description=(
-            "Upper bound of the search range for the ARA inner-objective "
-            "'steer_bad_behavior_weight', which the outer optimizer samples on a "
-            "log scale. Applies to both ARA and ARA-LoRA. Defaults to 0.001: the "
-            "optimizer reliably prefers the low end, and large values are the "
-            "dominant source of non-finite-KL ('blown up') trials on low-bpw EXL3 "
-            "ARA-LoRA. Raise it (e.g. to 1.0) to explore a wider phase space."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _validate_steer_bad_behavior_weight_range(self) -> "Settings":
-        if self.steer_bad_behavior_weight_min <= 0:
-            raise ValueError("steer_bad_behavior_weight_min must be positive.")
-        if self.steer_bad_behavior_weight_max < self.steer_bad_behavior_weight_min:
-            raise ValueError(
-                "steer_bad_behavior_weight_max must be >= "
-                "steer_bad_behavior_weight_min."
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_modifier_settings(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        value = deepcopy(value)
+        for key in ("use_ara", "use_ara_lora"):
+            if value.get(key) is not None:
+                value[key] = TypeAdapter(bool).validate_python(value[key])
+        legacy_keys = {
+            "use_ara",
+            "use_ara_lora",
+            "ara_lora_rank",
+            "ara_lora_regularization",
+            "steer_bad_behavior_weight_min",
+            "steer_bad_behavior_weight_max",
+            "invert_target",
+            "row_normalization",
+            "orthogonalize_direction",
+            "full_normalization_lora_rank",
+            "winsorization_quantile",
+            "good_prompts",
+            "bad_prompts",
+        }
+        if not any(value.get(key) is not None for key in legacy_keys):
+            return value
+        if "modifiers" not in value:
+            ara = value.get("use_ara") or value.get("use_ara_lora")
+            plugin = (
+                "heretic.modifiers.ara.ARA"
+                if ara
+                else "heretic.modifiers.abliteration.Abliteration"
             )
-        return self
-
-    invert_target: bool = Field(
-        default=False,
-        description=(
-            "Invert the steering target: instead of pushing 'bad' outputs toward "
-            "'good' outputs (suppressing the targeted behavior), push them further "
-            "from 'good' and deeper into the 'bad' cluster (amplifying the "
-            "targeted behavior). To make the outer optimizer maximize the "
-            "behavior's expression, also set optimization = \"maximize\" on the "
-            "KeywordRate scorer in [[scorers]]. Useful for "
-            "general behavioral steering when 'good'='neutral' and 'bad'='target "
-            "behavior'. Applies to both ARA and ARA-LoRA inner objectives. "
-            "Like the default direction, the inner ARA objective is geometrically "
-            "unbounded; consider setting ara_lora_regularization to a small "
-            "positive value if A@B overflows fp16."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _ara_lora_implies_ara(self) -> "Settings":
-        # ARA LoRA is a sub-mode of ARA: the module-I/O collection and ARA
-        # parameter suggestion are gated on use_ara, but the abliteration
-        # dispatch enters the LoRA branch on use_ara_lora alone. Passing
-        # --use-ara-lora without --use-ara would otherwise crash with a
-        # NameError on good_module_io. Treat use_ara_lora as implying use_ara.
-        if self.use_ara_lora:
-            self.use_ara = True
-        return self
-
-    @model_validator(mode="after")
-    def _exl3_ara_requires_lora(self) -> "Settings":
-        # Plain ARA edits each weight matrix in place. EXL3 weights are stored
-        # as quantized trellis blobs that can't be modified in place, so the
-        # EXL3 backend only implements the LoRA variant (ara_lora_abliterate).
-        # Without this guard, --quantization exl3 --use-ara would load the
-        # model and capture module I/O before crashing on the first trial with
-        # an AttributeError. Fail fast instead.
-        if (
-            self.quantization == QuantizationMethod.EXL3
-            and self.use_ara
-            and not self.use_ara_lora
-        ):
-            raise ValueError(
-                "The EXL3 backend cannot run plain ARA (it can't edit quantized "
-                "weights in place). Add --use-ara-lora to use the LoRA variant."
-            )
-        return self
-
-    orthogonalize_direction: bool = Field(
-        default=True,
-        description=(
-            "Whether to adjust the residual directions so that only the component that is "
-            "orthogonal to the good direction is subtracted during abliteration."
-        ),
-    )
-
-    row_normalization: RowNormalization = Field(
-        default=RowNormalization.FULL,
-        description=(
-            "How to apply row normalization of the weights. Options: "
-            '"none" (no normalization), '
-            '"pre" (compute LoRA adapter relative to row-normalized weights), '
-            '"full" (like "pre", but renormalizes to preserve original row magnitudes).'
-        ),
-    )
-
-    full_normalization_lora_rank: PositiveInt = Field(
-        default=3,
-        description=(
-            'The rank of the LoRA adapter to use when "full" row normalization is used. '
-            "Row magnitude preservation is approximate due to non-linear effects, "
-            "and this determines the rank of that approximation. Higher ranks produce "
-            "larger output files and may slow down evaluation."
-        ),
-    )
-
-    winsorization_quantile: float = Field(
-        default=1.0,
-        description=(
-            "The symmetric winsorization to apply to the per-prompt, per-layer residual vectors, "
-            "expressed as the quantile to clamp to (between 0 and 1). Disabled by default. "
-            'This can tame so-called "massive activations" that occur in some models. '
-            "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
-            "of the components, then clamps the magnitudes of all components to that quantile."
-        ),
-    )
+            value["modifiers"] = [{"plugin": plugin}]
+        for entry in value["modifiers"]:
+            entry = entry.model_dump() if isinstance(entry, ModifierConfig) else entry
+            plugin = entry["plugin"]
+            if plugin not in (
+                "heretic.modifiers.ara.ARA",
+                "heretic.modifiers.abliteration.Abliteration",
+            ):
+                continue
+            ara = plugin.endswith(".ARA")
+            name = "ARA" if ara else "Abliteration"
+            if entry.get("instance_name"):
+                name += "_" + entry["instance_name"]
+            target = value.setdefault("modifier", {}).setdefault(name, {})
+            mapping = {"good_prompts": "good_prompts", "bad_prompts": "bad_prompts"}
+            if ara:
+                mapping.update(
+                    {
+                        "ara_lora_rank": "lora_rank",
+                        "ara_lora_regularization": "lora_regularization",
+                        "invert_target": "invert_target",
+                        "steer_bad_behavior_weight_min": "steer_bad_behavior_weight_min",
+                        "steer_bad_behavior_weight_max": "steer_bad_behavior_weight_max",
+                    }
+                )
+                # Preserve this fork's defaults for legacy configurations.
+                target.setdefault("lora_rank", value.get("ara_lora_rank") or 128)
+                target.setdefault(
+                    "steer_bad_behavior_weight_max",
+                    value.get("steer_bad_behavior_weight_max") or 0.001,
+                )
+                if value.get("row_normalization") is not None:
+                    target.setdefault(
+                        "preserve_row_magnitudes", value["row_normalization"] == "full"
+                    )
+            else:
+                for key in (
+                    "orthogonalize_direction",
+                    "row_normalization",
+                    "full_normalization_lora_rank",
+                    "winsorization_quantile",
+                ):
+                    mapping[key] = key
+            for old, new in mapping.items():
+                if value.get(old) is not None:
+                    target.setdefault(new, value[old])
+        # Dataset tables now belong to the modifier, including in saved run metadata.
+        value.pop("good_prompts", None)
+        value.pop("bad_prompts", None)
+        return value
 
     n_trials: PositiveInt = Field(
-        default=200,
+        default=100,
         description="Number of abliteration trials to run during optimization.",
     )
 
     n_startup_trials: NonNegativeInt = Field(
-        default=60,
+        default=30,
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
@@ -732,31 +730,9 @@ class Settings(BaseSettings):
         description="System prompt to use when prompting the model.",
     )
 
-    good_prompts: DatasetSpecification = Field(
-        default=DatasetSpecification(
-            dataset="mlabonne/harmless_alpaca",
-            split="train[:400]",
-            column="text",
-            residual_plot_label='"Harmless" prompts',
-            residual_plot_color="royalblue",
-        ),
-        description="Dataset of prompts that tend to not result in refusals (used for calculating refusal directions).",
-    )
-
-    bad_prompts: DatasetSpecification = Field(
-        default=DatasetSpecification(
-            dataset="mlabonne/harmful_behaviors",
-            split="train[:400]",
-            column="text",
-            residual_plot_label='"Harmful" prompts',
-            residual_plot_color="darkorange",
-        ),
-        description="Dataset of prompts that tend to result in refusals (used for calculating refusal directions).",
-    )
-
     # We intentionally allow extra keys so users can provide plugin-specific
     # configuration in TOML tables like `[scorer.KeywordRate]` which are later
-    # consumed via `settings.model_extra` (see `Evaluator._get_plugin_namespace`).
+    # consumed via `settings.model_extra` (see `plugin.get_plugin_namespace`).
     model_config = SettingsConfigDict(extra="allow")
 
     @classmethod

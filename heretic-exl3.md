@@ -1,34 +1,122 @@
-# Heretic EXL3 Integration Notes
+# Heretic EXL3 integration
 
-This repository includes an EXL3 integration for Heretic, with EXL3 selection wired into existing quantization semantics.
+This fork tracks Heretic **2.0.0.dev0**, upstream commit
+`a09b4eae079cfcccd3e1e5ae75e46f2b3b378b2a` (2026-10-03 sync).
+The EXL3 integration was source-audited against ExLlamaV3 **1.5.4**,
+commit `16a49792a3c93d8432d72e6c4bce800841566577`, and the local 1.5.3-based
+fork. The optional dependency accepts `>=1.5.3,<1.6`; the lockfile resolves
+1.5.3, the version available on PyPI at sync time.
 
-## What was changed
+## Installation and selection
 
-- Added EXL3 as a quantization option:
-  - `QuantizationMethod.EXL3 = "exl3"`
-  - EXL3 is now selected via `--quantization exl3` (or `quantization = "exl3"` in TOML).
-- Removed the separate backend selection path for EXL3 from runtime settings.
-- Updated model construction logic to instantiate `Exl3Model` when `settings.quantization == QuantizationMethod.EXL3`.
-- Updated EXL3-specific save/upload behavior checks to use quantization mode.
-- Updated default config comments to include `exl3` under quantization options.
-- Removed temporary EXL3 helper scripts that were used during bring-up.
+Python 3.10.11 or newer is required. Install this checkout with the `exl3`
+extra into a CUDA-enabled environment, or keep your existing editable EXL3
+installation and install Heretic without replacing it.
 
-## Current operator-facing behavior
+```sh
+pip install -e '.[exl3]'
+heretic --model /path/to/exl3-model --quantization exl3
+```
 
-Use EXL3 by setting:
+Upstream's `uv` configuration defaults to **CPU PyTorch wheels** for CI.
+For GPU use, explicitly override its `pytorch` index with the CUDA wheel index
+appropriate for your installed EXL3 build. Do not run an unqualified `uv sync`
+in an existing CUDA environment expecting it to preserve that environment.
+The sync itself did not install or upgrade anything in the existing `.venv`
+or the neighboring EXL3 checkout.
 
-- CLI: `--quantization exl3`
-- Config: `quantization = "exl3"`
+## Modifier plugins and old configs
 
-EXL3 mode continues to use adapter-side save/upload behavior where merge-into-quantized storage is not supported.
+EXL3 now participates in upstream's modifier lifecycle: capture activations,
+allocate adapters at the plugin's requested rank, reset adapters, and modify.
+Both built-in modifiers dispatch to the EXL3 implementation:
 
-## Files touched for EXL3 integration
+- `heretic.modifiers.ara.ARA`: ARA with LoRA; preserves the bounded routed-expert
+  capture and the factored objective when row preservation is disabled.
+- `heretic.modifiers.abliteration.Abliteration`: directional ablation with
+  `row_normalization = "none"`. PRE/FULL directional normalization remains
+  unsupported on EXL3 and is rejected before modifier capture.
 
-- `src/heretic/config.py`
-- `src/heretic/main.py`
-- `config.default.toml`
+A new ARA config can use:
 
-## Cleanup choices
+```toml
+model = "/path/to/exl3-model"
+quantization = "exl3"
+modifiers = [{ plugin = "heretic.modifiers.ara.ARA" }]
 
-- Removed handoff/debug documents in favor of this single concise EXL3 repo note.
-- Removed ad-hoc EXL3 scripts from `scripts/`.
+[modifier.ARA]
+lora_rank = 128
+preserve_row_magnitudes = false
+steer_bad_behavior_weight_min = 0.0001
+steer_bad_behavior_weight_max = 0.001
+invert_target = false
+lora_regularization = 0.0
+
+[modifier.ARA.good_prompts]
+dataset = "good.txt"
+
+[modifier.ARA.bad_prompts]
+dataset = "bad.txt"
+```
+
+Legacy config files and CLI flags are accepted and normalized into the new
+plugin tables. Explicit plugin settings take precedence. Saved settings use
+the canonical plugin schema.
+
+| Legacy setting | Plugin setting |
+| --- | --- |
+| `use_ara` / `use_ara_lora` | Select ARA; either true selects the LoRA-based 2.x ARA |
+| `ara_lora_rank` | `modifier.ARA.lora_rank` |
+| `ara_lora_regularization` | `modifier.ARA.lora_regularization` |
+| `invert_target` | `modifier.ARA.invert_target` |
+| `steer_bad_behavior_weight_min/max` | Same names under `modifier.ARA` |
+| ARA `row_normalization` | `preserve_row_magnitudes` (true only for `full`) |
+| `[good_prompts]`, `[bad_prompts]` | Corresponding tables under the selected modifier |
+| Directional normalization/orthogonalization/winsorization | Same names under `modifier.Abliteration` |
+
+Legacy ARA configs retain this fork's rank-128 and steering-maximum-0.001
+fallbacks. New plugin configs use upstream defaults unless explicitly overridden.
+`chat_template_kwargs` is preserved and forwarded on both EXL3 and HF paths.
+Old optimization checkpoints use a different parameter schema; begin a new study
+for 2.x rather than resuming a 1.x checkpoint.
+
+## Loading, generation, and export
+
+Layer splitting, `exl3_gpu_split`, `exl3_reserve_per_device`,
+`exl3_load_max_chunk_size`, and sliced quantized-weight reconstruction remain.
+Tensor parallelism remains excluded because it bypasses the capture hooks.
+LoRA output widths now account for EXL3's trimmed padded projections. Capture
+hooks are restored on failure. Resetting adapters invalidates the generator's
+prefix cache, and responses come directly from the generator without a second
+prompt/completion tokenization pass.
+
+Save either a PEFT adapter or merge into an original HF base model. Set
+`exl3_base_model` when the quantized model metadata cannot identify that base.
+Adapters retain their active rank and export unpadded tensors in PEFT orientation.
+Merging loads the HF base on CPU; it does not rewrite quantized EXL3 weights.
+The built-in BenchmarkScore and interactive benchmark use Hugging Face's
+lm-eval backend: benchmark a merged HF export instead of an EXL3 model.
+
+## Validation and deferred GPU checks
+
+CPU validation uses an isolated environment with CPU-only PyTorch:
+
+```sh
+CUDA_VISIBLE_DEVICES='' UV_PROJECT_ENVIRONMENT=/tmp/heretic-sync-venv uv sync --locked --dev
+CUDA_VISIBLE_DEVICES='' /tmp/heretic-sync-venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+/tmp/heretic-sync-venv/bin/ruff check --extend-select I .
+/tmp/heretic-sync-venv/bin/ruff format --check .
+/tmp/heretic-sync-venv/bin/ty check --error-on-warning .
+uv build
+```
+
+Regression coverage includes config migration, modifier dispatch, CPU ARA
+optimization, trimmed padding, adapter export, residual options, response
+handling, cache invalidation, and hook cleanup. All repository config files
+were validated, CLI help was checked, and wheel/source packages were built.
+
+**No GPU workloads were run.** Real EXL3 loading, CUDA reconstruction kernels,
+multi-GPU placement, dense/MoE generation and numerical comparison with saved
+adapters still require an explicitly authorized GPU smoke test. CPU tests and
+source inspection do not establish GPU numerical correctness. The upstream
+model-download/hash integration suite was not run during this sync.

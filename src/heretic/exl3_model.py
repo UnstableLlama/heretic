@@ -4,9 +4,9 @@
 """ExLlamaV3 (EXL3) backend for Heretic.
 
 This module provides ``Exl3Model``, a drop-in replacement for ``model.Model``
-that duck-types the surface ``main.py`` uses. It targets ExLlamaV3 0.0.34.
+that duck-types the surface ``main.py`` uses. Its integration is source-audited against ExLlamaV3 1.5.4.
 
-Design notes (see HANDOFF_EXL3.md):
+Design notes:
 
 * Module discovery walks ``model`` via its ``__iter__`` and filters by
   ``.key`` regex. Keys mirror HuggingFace safetensors naming
@@ -45,24 +45,27 @@ import json
 import math
 import re
 import shutil
-
-import psutil
 from contextlib import suppress
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
+import psutil
 import torch
 import torch.linalg as LA
 import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import LBFGS
 
-from .config import RowNormalization, Settings
-from .model import ARAParameters, AbliterationParameters, ModuleIO
+from .config import Settings
+from .model import ModuleIO
+from .modifiers.abliteration import RowNormalization
+from .modifiers.abliteration import WeightDistribution as AbliterationParameters
+from .modifiers.ara import Parameters as ARAParameters
+from .modifiers.ara import Settings as ARASettings
+from .modifiers.ara import mean_distances_to_knn
 from .system import empty_cache
-from .utils import Prompt, batchify, mean_distances_to_knn, print
-
+from .utils import Prompt, batchify, print
 
 # Match keys like:
 #   model.layers.<N>.self_attn.o_proj                     (standard)
@@ -112,6 +115,7 @@ def _check_ram_guard() -> None:
             "good/bad prompt counts, or file a capture-memory bug."
         )
 
+
 # Block-level keys, used to find decoder layers without depending on
 # isinstance(TransformerBlock) (some architectures use custom block
 # classes).
@@ -154,16 +158,19 @@ class _Exl3Tokenizer:
     def __init__(self, exl3_tokenizer: Any, model_path: str):
         self.exl3 = exl3_tokenizer
         self._model_path = model_path
-        self._hf = None
+        self._hf: Any = None
         # Lazy: only load the HF tokenizer if something asks for it.
 
     def _ensure_hf(self) -> Any:
         if self._hf is None:
             from transformers import AutoTokenizer
 
-            self._hf = AutoTokenizer.from_pretrained(
-                self._model_path,
-                trust_remote_code=False,
+            self._hf = cast(
+                Any,
+                AutoTokenizer.from_pretrained(
+                    self._model_path,
+                    trust_remote_code=False,
+                ),
             )
             if self._hf.pad_token is None:
                 self._hf.pad_token = self._hf.eos_token
@@ -205,7 +212,7 @@ class Exl3Model:
 
     settings: Settings
     needs_reload: bool
-    tokenizer: _Exl3Tokenizer
+    tokenizer: Any
 
     def __init__(self, settings: Settings, *, inspect_only: bool = False):
         """Load an EXL3 model.
@@ -218,6 +225,7 @@ class Exl3Model:
         """
         self.settings = settings
         self.needs_reload = False
+        self._adapter_rank = 1
         # Multimodal processor (vision preprocessing). Mirrors model.Model's
         # `processor` attribute, which main.py reads on the merged-model
         # save/upload path. Populated lazily in get_merged_model when the
@@ -252,7 +260,7 @@ class Exl3Model:
             # need weights. Residual hooks aren't installed because no
             # forward pass will run.
             self.cache = None
-            self.tokenizer = None  # type: ignore[assignment]
+            self.tokenizer = None
         else:
             # Cache sizing: the user setting is the working bound on
             #   batch_size * seq_len  during any forward pass.
@@ -295,7 +303,9 @@ class Exl3Model:
         all_components: dict[str, int] = {}
         for per_layer in self._layer_modules:
             for component, modules in per_layer.items():
-                all_components[component] = all_components.get(component, 0) + len(modules)
+                all_components[component] = all_components.get(component, 0) + len(
+                    modules
+                )
         print("* Abliterable components:")
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
@@ -334,9 +344,7 @@ class Exl3Model:
         kwargs: dict[str, Any] = {"progressbar": True}
 
         try:
-            accepted = set(
-                inspect.signature(self.model.load_gen).parameters  # ty:ignore[possibly-missing-attribute]
-            )
+            accepted = set(inspect.signature(self.model.load_gen).parameters)
         except (AttributeError, ValueError, TypeError):
             accepted = set()
 
@@ -441,7 +449,7 @@ class Exl3Model:
             ) from error
 
     @classmethod
-    def _resolve_exllamav3_api(cls) -> dict[str, type]:
+    def _resolve_exllamav3_api(cls) -> dict[str, Any]:
         """Resolve Config / Model / Cache / Tokenizer / Generator across
         exllamav3 versions. The top-level ``__init__.py`` re-exports vary
         between PyPI releases and master; the submodule paths are the
@@ -450,24 +458,34 @@ class Exl3Model:
         cls._import_exllamav3()  # raise a friendly error if missing
 
         candidates = {
-            "Config":    [("exllamav3.model.config", "Config"),
-                          ("exllamav3.config",       "Config"),
-                          ("exllamav3",              "Config")],
-            "Model":     [("exllamav3.model.model",  "Model"),
-                          ("exllamav3.model",        "Model"),
-                          ("exllamav3",              "Model")],
-            "Cache":     [("exllamav3.cache.cache",  "Cache"),
-                          ("exllamav3.cache",        "Cache"),
-                          ("exllamav3",              "Cache")],
-            "Tokenizer": [("exllamav3.tokenizer.tokenizer", "Tokenizer"),
-                          ("exllamav3.tokenizer",   "Tokenizer"),
-                          ("exllamav3",             "Tokenizer")],
-            "Generator": [("exllamav3.generator.generator", "Generator"),
-                          ("exllamav3.generator",   "Generator"),
-                          ("exllamav3",             "Generator")],
+            "Config": [
+                ("exllamav3.model.config", "Config"),
+                ("exllamav3.config", "Config"),
+                ("exllamav3", "Config"),
+            ],
+            "Model": [
+                ("exllamav3.model.model", "Model"),
+                ("exllamav3.model", "Model"),
+                ("exllamav3", "Model"),
+            ],
+            "Cache": [
+                ("exllamav3.cache.cache", "Cache"),
+                ("exllamav3.cache", "Cache"),
+                ("exllamav3", "Cache"),
+            ],
+            "Tokenizer": [
+                ("exllamav3.tokenizer.tokenizer", "Tokenizer"),
+                ("exllamav3.tokenizer", "Tokenizer"),
+                ("exllamav3", "Tokenizer"),
+            ],
+            "Generator": [
+                ("exllamav3.generator.generator", "Generator"),
+                ("exllamav3.generator", "Generator"),
+                ("exllamav3", "Generator"),
+            ],
         }
 
-        resolved: dict[str, type] = {}
+        resolved: dict[str, Any] = {}
         misses: dict[str, list[str]] = {}
         for name, attempts in candidates.items():
             for module_name, attr in attempts:
@@ -554,9 +572,15 @@ class Exl3Model:
                         self._allocate_lora_slot(module)
 
     def _lora_rank(self) -> int:
-        if self.settings.use_ara_lora:
-            return self.settings.ara_lora_rank
-        return 1
+        return self._adapter_rank
+
+    def apply_lora(self, lora_rank: int) -> None:
+        self._invalidate_generator()
+        self._adapter_rank = lora_rank
+        for per_layer in self._layer_modules:
+            for modules in per_layer.values():
+                for module in modules:
+                    self._allocate_lora_slot(module)
 
     def _allocate_lora_slot(self, module: Any) -> None:
         device = module.device
@@ -567,7 +591,12 @@ class Exl3Model:
             device=device,
         )
         b = torch.zeros(
-            (rank, module.out_features),
+            (
+                rank,
+                module.out_features_unpadded
+                if getattr(module, "trim_padded_out", False)
+                else module.out_features,
+            ),
             dtype=torch.float16,
             device=device,
         )
@@ -637,6 +666,7 @@ class Exl3Model:
                 captured = out[0] if isinstance(out, tuple) else out
                 states.append(captured.half().clone())
                 return out
+
             return wrapped
 
         for idx, block in enumerate(blocks):
@@ -672,8 +702,9 @@ class Exl3Model:
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
+        row_normalization: RowNormalization = RowNormalization.NONE,
     ) -> None:
-        if self.settings.row_normalization != RowNormalization.NONE:
+        if row_normalization != RowNormalization.NONE:
             # Row normalization paths require either reading and overwriting
             # W (PRE) or a higher-rank SVD decomposition (FULL). The
             # pre-allocated rank-1 slot can't represent FULL, and reading
@@ -681,7 +712,7 @@ class Exl3Model:
             # expensive to do silently. Surface the limitation explicitly.
             raise NotImplementedError(
                 "EXL3 backend currently supports only row_normalization='none'. "
-                f"Got '{self.settings.row_normalization.value}'. "
+                f"Got '{row_normalization.value}'. "
                 "PRE/FULL would require dequantizing every target weight per "
                 "trial and (for FULL) widening the rank-1 adapter — possible "
                 "but not implemented in this pass."
@@ -703,7 +734,7 @@ class Exl3Model:
         for layer_index in range(len(self._layer_modules)):
             for component, modules in self._layer_modules[layer_index].items():
                 params = parameters[component]
-                distance = cast(float, abs(layer_index - params.max_weight_position))
+                distance = abs(layer_index - params.max_weight_position)
                 if distance > params.min_weight_distance:
                     # Out of kernel support: zero the slot so resetting one
                     # layer's contribution doesn't carry over from a prior
@@ -768,7 +799,7 @@ class Exl3Model:
                 f"Unknown Linear.quant_type {module.quant_type!r} on {module.key}"
             )
 
-        B_unpad = (-kernel_weight * v_u).unsqueeze(0)   # (1, out_u)
+        B_unpad = (-kernel_weight * v_u).unsqueeze(0)  # (1, out_u)
 
         a_slot = module.lora_a_tensors[self._lora_key]
         b_slot = module.lora_b_tensors[self._lora_key]
@@ -831,8 +862,8 @@ class Exl3Model:
         """
         ext = self._exl3_ext()
         device = inner.trellis.device
-        in_f = inner.in_features      # padded
-        out_f = inner.out_features    # padded
+        in_f = inner.in_features  # padded
+        out_f = inner.out_features  # padded
 
         # --- Output side: u = H_R . (svh (.) v), length out_f. ---
         v_pad = torch.zeros((1, out_f), dtype=torch.float16, device=device)
@@ -848,14 +879,12 @@ class Exl3Model:
         width = self._exl3_slice_width()
         c = torch.zeros(in_f, dtype=torch.float32, device=device)
         w_buf = torch.empty(
-            (in_f, min(width, out_f)), dtype=torch.float16, device=device
+            in_f * min(width, out_f), dtype=torch.float16, device=device
         )
         for n0 in range(0, out_f, width):
             n1 = min(n0 + width, out_f)
-            w = w_buf[:, : n1 - n0]
-            ext.reconstruct_slice(
-                w, inner.trellis, inner.K, inner.mcg, inner.mul1, n0
-            )
+            w = w_buf[: in_f * (n1 - n0)].view(in_f, n1 - n0)
+            ext.reconstruct_slice(w, inner.trellis, inner.K, inner.mcg, inner.mul1, n0)
             c += w.to(torch.float32) @ u_f32[n0:n1]
 
         # --- Input side: A = suh (.) (H_L . c), length in_f. ---
@@ -864,16 +893,19 @@ class Exl3Model:
         ext.had_r_128(c16, a, None, inner.suh, 1.0)
         return a.view(in_f)[:in_u].to(torch.float32)
 
-    def reset_model(self) -> None:
+    def reset_model(self) -> bool:
         """Zero all LoRA contributions. The current model stays loaded; no
         weight reload is necessary because abliteration happens entirely
         through the additive LoRA path.
         """
+        self._invalidate_generator()
         for per_layer in self._layer_modules:
             for modules in per_layer.values():
                 for module in modules:
                     module.lora_a_tensors[self._lora_key].zero_()
                     module.lora_b_tensors[self._lora_key].zero_()
+
+        return True
 
     # ------------------------------------------------------------------
     # ARA: module I/O capture + ARA LoRA optimisation
@@ -960,28 +992,31 @@ class Exl3Model:
                         )
                         originals.append((module, orig))
 
-            input_ids = self._tokenize_chat(batch)
-            with torch.inference_mode():
-                self.model.forward(input_ids, params={})
-
-            for module, orig in originals:
-                module.forward = orig
+            try:
+                input_ids = self._tokenize_chat(batch)
+                with torch.inference_mode():
+                    self.model.forward(input_ids, params={})
+            finally:
+                for module, orig in originals:
+                    module.forward = orig
 
         # Finalise: concatenate each module's chunk list into one tensor.
         module_io: ModuleIO = [{} for _ in range(len(self._layer_modules))]
-        for key in in_chunks:
+        for key, chunks in in_chunks.items():
             li, comp, mi = key
-            inp = torch.cat(in_chunks[key], dim=0)
+            inp = torch.cat(chunks, dim=0)
             outp = torch.cat(out_chunks[key], dim=0)
             module_io[li].setdefault(comp, {})[mi] = (inp, outp)
 
         return module_io
 
+    @torch.enable_grad()
     def ara_lora_abliterate(
         self,
         good_module_io: ModuleIO,
         bad_module_io: ModuleIO,
         parameters: ARAParameters,
+        settings: ARASettings,
     ) -> None:
         """ARA LoRA for EXL3: optimise the pre-allocated LoRA A/B tensors
         using the same objective as standard ARA, but operating in the
@@ -1011,11 +1046,11 @@ class Exl3Model:
                     # slot, so a skip leaves this expert un-abliterated -- correct,
                     # since an expert that barely fires on bad prompts isn't
                     # carrying the behavior being removed.
-                    good_io = good_module_io[layer_index].get(component, {}).get(
-                        module_index
+                    good_io = (
+                        good_module_io[layer_index].get(component, {}).get(module_index)
                     )
-                    bad_io = bad_module_io[layer_index].get(component, {}).get(
-                        module_index
+                    bad_io = (
+                        bad_module_io[layer_index].get(component, {}).get(module_index)
                     )
                     if (
                         good_io is None
@@ -1048,21 +1083,21 @@ class Exl3Model:
                     good_input, good_output = good_io
                     bad_input, bad_output = bad_io
 
-                    good_input = good_input.float().to(device)
-                    good_output = good_output.float().to(device)
-                    bad_input = bad_input.float().to(device)
-                    bad_output = bad_output.float().to(device)
+                    good_input = good_input[:, :in_u].float().to(device)
+                    good_output = good_output[:, :out_u].float().to(device)
+                    bad_input = bad_input[:, :in_u].float().to(device)
+                    bad_output = bad_output[:, :out_u].float().to(device)
 
                     # Norm-preserving (FULL) needs the full effective weight, so
                     # it must be dequantized. Every other mode factors the LoRA
                     # delta onto the captured outputs (see objective below) and
                     # never materializes the (in, out) weight — far less VRAM.
-                    normalize = (
-                        self.settings.row_normalization == RowNormalization.FULL
-                    )
+                    normalize = settings.preserve_row_magnitudes
                     if normalize:
                         W_base = self._dequantize_weight(module).to(device)
-                        W_row_norms = LA.vector_norm(W_base, dim=0, keepdim=True).detach()
+                        W_row_norms = LA.vector_norm(
+                            W_base, dim=0, keepdim=True
+                        ).detach()
 
                     def objective(A: Tensor, B: Tensor) -> Tensor:
                         if normalize:
@@ -1097,7 +1132,7 @@ class Exl3Model:
                                 parameters.neighbor_count,
                             ).mean()
                         )
-                        if self.settings.invert_target:
+                        if settings.invert_target:
                             steer_bad_behavior = -steer_bad_behavior
 
                         loss = (
@@ -1109,16 +1144,16 @@ class Exl3Model:
                         # the otherwise-unbounded overcorrection objective and
                         # resolves the A@B scale degeneracy, preventing fp16
                         # blow-ups. Disabled when the strength is 0.
-                        reg = self.settings.ara_lora_regularization
+                        reg = settings.lora_regularization
                         if reg:
                             loss = loss + reg * (A.pow(2).mean() + B.pow(2).mean())
                         return loss
 
                     optimizer = LBFGS(
                         [a_param, b_param],
-                        lr=1.0,
-                        max_iter=20,
-                        history_size=10,
+                        lr=settings.learning_rate,
+                        max_iter=settings.max_iter,
+                        history_size=settings.history_size,
                         line_search_fn="strong_wolfe",
                     )
 
@@ -1128,8 +1163,12 @@ class Exl3Model:
                         loss.backward()
                         return loss
 
-                    for step in range(5):
-                        optimizer.step(closure)
+                    for step in range(settings.n_optimization_steps):
+                        loss = optimizer.step(closure)
+                        if settings.print_loss:
+                            print(
+                                f"[{module.key}] Step: {step + 1}, Loss: {loss.item():.6f}"
+                            )
 
                     # Write optimised values back into the pre-allocated slots.
                     # The ARA overcorrection objective is unbounded below (it
@@ -1226,7 +1265,9 @@ class Exl3Model:
         states = params.get("export_states", [])
         return logits, states
 
-    def get_residuals(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals(
+        self, prompts: list[Prompt], winsorization_quantile: float = 1.0
+    ) -> Tensor:
         input_ids = self._tokenize_chat(prompts)
         _, states = self._forward(input_ids, last_only=False, capture_residuals=True)
         if len(states) != self._num_layers + 1:
@@ -1252,11 +1293,11 @@ class Exl3Model:
             dim=1,
         )
 
-        if 0 <= self.settings.winsorization_quantile < 1:
+        if 0 <= winsorization_quantile < 1:
             abs_residuals = torch.abs(residuals)
             thresholds = torch.quantile(
                 abs_residuals,
-                self.settings.winsorization_quantile,
+                winsorization_quantile,
                 dim=2,
                 keepdim=True,
             )
@@ -1267,19 +1308,23 @@ class Exl3Model:
             empty_cache()
         return residuals
 
-    def get_residuals_batched(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals_batched(
+        self, prompts: list[Prompt], winsorization_quantile: float = 1.0
+    ) -> Tensor:
         out = []
         for batch in batchify(prompts, self.settings.batch_size):
-            out.append(self.get_residuals(batch))
+            out.append(self.get_residuals(batch, winsorization_quantile))
         return torch.cat(out, dim=0)
 
-    def get_residuals_mean(self, prompts: list[Prompt]) -> Tensor:
+    def get_residuals_mean(
+        self, prompts: list[Prompt], winsorization_quantile: float = 1.0
+    ) -> Tensor:
         if not prompts:
             raise ValueError("prompts must not be empty")
         running_sum: Tensor | None = None
         total = 0
         for batch in batchify(prompts, self.settings.batch_size):
-            r = self.get_residuals(batch)
+            r = self.get_residuals(batch, winsorization_quantile)
             s = r.sum(dim=0, dtype=torch.float64).cpu()
             running_sum = s if running_sum is None else running_sum + s
             total += r.shape[0]
@@ -1307,6 +1352,13 @@ class Exl3Model:
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
+
+    def _invalidate_generator(self) -> None:
+        generator = getattr(self, "_generator", None)
+        if generator is not None:
+            generator.clear_queue()
+            generator.filter_pool.shutdown(wait=True)
+            self._generator = None
 
     def _ensure_generator(self) -> Any:
         if self._generator is None:
@@ -1368,7 +1420,9 @@ class Exl3Model:
         ``inputs["input_ids"].shape[1]`` to slice off the prompt; we mimic
         that by returning the input ids and the concatenated full ids.
         """
-        max_new_tokens = int(kwargs.get("max_new_tokens", self.settings.max_response_length))
+        max_new_tokens = int(
+            kwargs.get("max_new_tokens", self.settings.max_response_length)
+        )
         chat_prompts = self._render_chat_prompts(prompts)
         generator = self._ensure_generator()
 
@@ -1381,7 +1435,8 @@ class Exl3Model:
             prompt=chat_prompts,
             max_new_tokens=max_new_tokens,
             completion_only=True,
-            add_bos=True,
+            add_bos=False,
+            encode_special_tokens=True,
             sampler=self._greedy_sampler(),
             seed=0,
         )
@@ -1398,20 +1453,28 @@ class Exl3Model:
     def get_responses(
         self, prompts: list[Prompt], skip_special_tokens: bool = False
     ) -> list[str]:
-        inputs, outputs = self.generate(
-            prompts, max_new_tokens=self.settings.max_response_length
+        # Return completions directly. Re-tokenizing padded prompt+completion
+        # batches can shift the prompt boundary and truncate shorter responses.
+        responses = self._ensure_generator().generate(
+            prompt=self._render_chat_prompts(prompts),
+            max_new_tokens=self.settings.max_response_length,
+            completion_only=True,
+            add_bos=False,  # Chat templates already include required special tokens.
+            encode_special_tokens=True,
+            decode_special_tokens=not skip_special_tokens,
+            sampler=self._greedy_sampler(),
+            seed=0,
         )
-        prompt_len = inputs["input_ids"].shape[1]
-        return self.tokenizer.batch_decode(
-            outputs[:, prompt_len:], skip_special_tokens=skip_special_tokens
-        )
+        return [responses] if isinstance(responses, str) else responses
 
     def get_responses_batched(
         self, prompts: list[Prompt], skip_special_tokens: bool = False
     ) -> list[str]:
         out: list[str] = []
         for batch in batchify(prompts, self.settings.batch_size):
-            out.extend(self.get_responses(batch, skip_special_tokens=skip_special_tokens))
+            out.extend(
+                self.get_responses(batch, skip_special_tokens=skip_special_tokens)
+            )
         return out
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
@@ -1435,7 +1498,8 @@ class Exl3Model:
             prompt=chat_prompt,
             max_new_tokens=self.settings.max_response_length,
             completion_only=True,
-            add_bos=True,
+            add_bos=False,
+            encode_special_tokens=True,
             sampler=self._greedy_sampler(),
             seed=0,
         )
@@ -1566,9 +1630,7 @@ class Exl3Model:
             if any("vision_config" in config for config in configs):
                 return True
 
-        return any(
-            "language_model" in key.split(".") for key in self._all_module_keys
-        )
+        return any("language_model" in key.split(".") for key in self._all_module_keys)
 
     def get_base_model_hint(self) -> str:
         """Return best-effort HF base model hint for EXL3 merge prompts."""
@@ -1670,7 +1732,11 @@ class Exl3Model:
         # Also copy the original tokenizer files alongside the adapter so the
         # output dir is self-sufficient as a PEFT adapter against the base.
         src = Path(self.settings.model).expanduser()
-        for fname in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+        for fname in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ):
             sp = src / fname
             if sp.exists():
                 with suppress(Exception):
@@ -1680,8 +1746,7 @@ class Exl3Model:
         # which AutoModel class to use (this is the #1 pitfall for EXL3
         # adapters on multimodal models like Qwen 3.5).
         model_class = (
-            "AutoModelForImageTextToText" if multimodal
-            else "AutoModelForCausalLM"
+            "AutoModelForImageTextToText" if multimodal else "AutoModelForCausalLM"
         )
         merge_script = (
             "#!/usr/bin/env python3\n"
@@ -1742,4 +1807,6 @@ class Exl3Model:
                 f"When merging, load the base model with "
                 f"[bold]{model_class}[/], not AutoModelForCausalLM."
             )
-        print(f"* A ready-to-use merge script was written to [bold]{out_dir}/merge.py[/]")
+        print(
+            f"* A ready-to-use merge script was written to [bold]{out_dir}/merge.py[/]"
+        )
