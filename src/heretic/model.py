@@ -284,6 +284,10 @@ class Model:
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
 
+        # PEFT initializes A randomly from the global RNG. B is zero, so this doesn't
+        # change the model, but zeroing A too keeps saved adapters reproducible.
+        self._zero_lora_weights()
+
         display_targets = sorted({name.rsplit(".", 1)[-1] for name in target_modules})
         print(
             f"* LoRA adapters initialized (target types: {', '.join(display_targets)})"
@@ -364,6 +368,11 @@ class Model:
             self.needs_reload = True
             return merged_model
 
+    def _zero_lora_weights(self):
+        for name, module in self.model.named_modules():
+            if ("lora_A" in name or "lora_B" in name) and hasattr(module, "weight"):
+                torch.nn.init.zeros_(module.weight)
+
     def reset_model(self):
         """
         Resets the model to a clean state for the next trial or evaluation.
@@ -386,9 +395,9 @@ class Model:
             and (not self.settings.use_ara or self.settings.use_ara_lora)
         ):
             # Reset LoRA adapters to zero (identity transformation).
-            for name, module in self.model.named_modules():
-                if "lora_B" in name and hasattr(module, "weight"):
-                    torch.nn.init.zeros_(module.weight)
+            # Zeroing A as well ensures that adapter weights of modules not modified
+            # by the next trial don't depend on what previous trials did.
+            self._zero_lora_weights()
             return
 
         # Purge existing model object from memory to make space.
@@ -774,6 +783,11 @@ class Model:
         bad_module_io: ModuleIO,
         parameters: ARAParameters,
     ):
+        # The model's reset zeroes both A and B, where all gradients vanish,
+        # so A must be initialized below for the optimization to make progress.
+        # Generating on the CPU keeps A independent of the device and the global RNG state.
+        generator = torch.Generator().manual_seed(cast(int, self.settings.seed))
+
         for layer_index in range(
             parameters.start_layer_index,
             parameters.end_layer_index,
@@ -800,6 +814,17 @@ class Model:
 
                     lora_A = cast(Tensor, module.lora_A["default"].weight)
                     lora_B = cast(Tensor, module.lora_B["default"].weight)
+
+                    # Initialize A the same way PEFT does, but deterministically. See
+                    # https://github.com/huggingface/peft/blob/v0.21.2/src/peft/tuners/lora/layer.py#L338
+                    initial_A = torch.empty(lora_A.shape)
+                    torch.nn.init.kaiming_uniform_(
+                        initial_A,
+                        a=math.sqrt(5),
+                        generator=generator,
+                    )
+                    with torch.no_grad():
+                        lora_A.copy_(initial_A)
 
                     good_input, good_output = good_module_io[layer_index][component][module_index]
                     bad_input, bad_output = bad_module_io[layer_index][component][module_index]
