@@ -36,6 +36,7 @@ from transformers.generation import (
 
 from .config import QuantizationMethod, RowNormalization, Settings
 from .system import empty_cache
+from .utils import strftime_fixed_date
 from .utils import Prompt, batchify, format_exception, mean_distances_to_knn, print
 
 
@@ -1017,6 +1018,8 @@ class Model:
                 chats,
                 add_generation_prompt=True,
                 tokenize=False,
+                # Overrides the function that templates call to get the current date.
+                strftime_now=strftime_fixed_date,
             ),
         )
 

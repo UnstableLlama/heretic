@@ -662,9 +662,11 @@ def run():
                 0,
                 len(model.get_layers()) // 2,
             )
+            # The end index is exclusive, so starting its range one above the start range's
+            # upper bound ensures that the layer range is never empty.
             end_layer_index = trial.suggest_int(
                 "end_layer_index",
-                len(model.get_layers()) // 2,
+                len(model.get_layers()) // 2 + 1,
                 len(model.get_layers()),
             )
             preserve_good_behavior_weight = trial.suggest_float(
@@ -683,10 +685,12 @@ def run():
                 0.0,
                 1.3,
             )
+            # The nearest neighbors are selected from the outputs for the good and bad prompts,
+            # which contain one vector per prompt, so there can't be more neighbors than prompts.
             neighbor_count = trial.suggest_int(
                 "neighbor_count",
                 1,
-                15,
+                min(15, len(good_prompts), len(bad_prompts)),
             )
 
             ara_parameters = ARAParameters(
