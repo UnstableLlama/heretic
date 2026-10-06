@@ -666,6 +666,8 @@ def run():
                 start_min,
                 start_max,
             )
+            # The end index is exclusive, so starting its range one above the start range's
+            # upper bound ensures that the layer range is never empty.
             end_layer_index = trial.suggest_int(
                 "end_layer_index",
                 end_min,
@@ -687,10 +689,13 @@ def run():
                 search_space.overcorrect_relative_weight_min,
                 search_space.overcorrect_relative_weight_max,
             )
+            # The nearest neighbors are selected from the outputs for the good and bad prompts,
+            # which contain one vector per prompt, so there can't be more neighbors than prompts.
+            neighbor_cap = min(len(good_prompts), len(bad_prompts))
             neighbor_count = trial.suggest_int(
                 "neighbor_count",
-                search_space.neighbor_count_min,
-                search_space.neighbor_count_max,
+                min(search_space.neighbor_count_min, neighbor_cap),
+                min(search_space.neighbor_count_max, neighbor_cap),
             )
 
             ara_parameters = ARAParameters(

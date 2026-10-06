@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -760,3 +761,10 @@ def upload_reproduce_folder(
                     repo_id=repo_id,
                     token=token,
                 )
+
+
+# Some chat templates (e.g. gpt-oss) insert the current date into the prompt,
+# which makes the residuals, and therefore the modified model, depend on the day
+# Heretic is run. Rendering templates with a fixed date keeps results reproducible.
+def strftime_fixed_date(format: str) -> str:
+    return datetime(2026, 1, 1, tzinfo=timezone.utc).strftime(format)

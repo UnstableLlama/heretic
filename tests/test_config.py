@@ -96,7 +96,7 @@ class ARASearchSpaceTests(unittest.TestCase):
     def test_defaults_match_the_original_ranges(self) -> None:
         space = ARASearchSpace()
 
-        self.assertEqual(space.layer_bounds(64), (0, 32, 32, 64))
+        self.assertEqual(space.layer_bounds(64), (0, 32, 33, 64))
         self.assertEqual(
             (
                 space.preserve_good_behavior_weight_min,

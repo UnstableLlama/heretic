@@ -184,7 +184,10 @@ class ARASearchSpace(BaseModel):
 
     end_layer_index_min: NonNegativeInt | None = Field(
         default=None,
-        description="Lower bound for end_layer_index. Default: half the number of layers.",
+        description=(
+            "Lower bound for end_layer_index. Default: half the number of layers "
+            "plus one (the end index is exclusive, so this keeps the range non-empty)."
+        ),
     )
 
     end_layer_index_max: NonNegativeInt | None = Field(
@@ -262,7 +265,7 @@ class ARASearchSpace(BaseModel):
 
         start_min = resolve(self.start_layer_index_min, 0)
         start_max = max(resolve(self.start_layer_index_max, half), start_min)
-        end_min = resolve(self.end_layer_index_min, half)
+        end_min = resolve(self.end_layer_index_min, half + 1)
         end_max = max(resolve(self.end_layer_index_max, layer_count), end_min)
         return start_min, start_max, end_min, end_max
 

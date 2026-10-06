@@ -61,6 +61,7 @@ from torch.optim import LBFGS
 from .config import RowNormalization, Settings
 from .model import ARAParameters, AbliterationParameters, ModuleIO
 from .system import empty_cache
+from .utils import strftime_fixed_date
 from .utils import Prompt, batchify, mean_distances_to_knn, print
 
 
@@ -1015,6 +1016,11 @@ class Exl3Model:
         using the same objective as standard ARA, but operating in the
         EXL3 weight convention (input-major: (in, out)).
         """
+        # One generator per ARA call: every module gets its own draw, but the
+        # sequence is fixed by the study seed, so a trial does not depend on what
+        # previous trials did and a restored trial reproduces the scored edit.
+        generator = torch.Generator().manual_seed(int(self.settings.seed))
+
         rank = self._lora_rank()
 
         for layer_index in range(
@@ -1061,11 +1067,14 @@ class Exl3Model:
                     # leaving the LoRA an identity (KL 0, no abliteration).
                     # Nonzero A keeps the product zero initially (no perturbation
                     # to the base output) while letting gradients flow into B.
-                    a_param = torch.empty(
-                        (in_u, rank), dtype=torch.float32, device=device
+                    # Initialized the same way PEFT does, but deterministically from
+                    # the study seed and on the CPU, so A is independent of the device,
+                    # of the global RNG state, and therefore of previous trials.
+                    a_param = torch.empty((in_u, rank), dtype=torch.float32)
+                    torch.nn.init.kaiming_uniform_(
+                        a_param, a=math.sqrt(5), generator=generator
                     )
-                    torch.nn.init.kaiming_uniform_(a_param, a=math.sqrt(5))
-                    a_param = a_param.detach().requires_grad_(True)
+                    a_param = a_param.to(device).detach().requires_grad_(True)
                     b_param = torch.zeros(
                         (rank, out_u),
                         dtype=torch.float32,
@@ -1207,7 +1216,11 @@ class Exl3Model:
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
-                chats, add_generation_prompt=True, tokenize=False
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                # Overrides the function that templates call to get the current date.
+                strftime_now=strftime_fixed_date,
             ),
         )
         if response_prefix is None:
@@ -1386,7 +1399,11 @@ class Exl3Model:
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
-                chats, add_generation_prompt=True, tokenize=False
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                # Overrides the function that templates call to get the current date.
+                strftime_now=strftime_fixed_date,
             ),
         )
         if self.settings.response_prefix:
