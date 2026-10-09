@@ -1,20 +1,19 @@
 [project]
 name = "heretic-llm"
-version = "1.4.0"
+version = "2.0.0.dev0"
 description = "Fully automatic censorship removal for language models"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [
     { name = "Philipp Emanuel Weidmann", email = "pew@worldwidemann.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10.11"
 keywords = ["llm", "transformer", "abliteration"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Environment :: GPU",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -22,51 +21,39 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "accelerate~=1.13",
-    "bitsandbytes~=0.49",
-    "datasets~=4.7",
-    "huggingface-hub~=1.7",
+    "accelerate~=1.15",
+    "bitsandbytes~=0.50",
+    "datasets~=5.0",
+    "huggingface-hub~=1.33",
     "immutabledict~=4.3",
     "langdetect~=1.0",
     "lm-eval[hf]~=0.4",
     "numpy~=2.2",
-    "optuna~=4.7",
-    "peft~=0.19",
+    "optuna~=5.0",
+    "peft~=0.21",
     "psutil~=7.2",
     "py-cpuinfo~=9.0",
-    "pydantic-settings~=2.13",
+    "pydantic-settings~=2.15",
     "questionary~=2.1",
-    "rich~=14.3",
+    "rich~=15.0",
     "tomli-w~=1.2",
     "torch",  # version deliberately unspecified
     "torchvision",  # version deliberately unspecified
-    "tqdm~=4.67",
-    "transformers[kernels]~=5.6",
+    "tqdm~=4.70",
+    "transformers[kernels]~=5.18",
 ]
 
 [project.optional-dependencies]
-research = [
-    "geom-median~=0.1",
-    "imageio~=2.37",
-    "matplotlib~=3.10",
-    "pacmap~=0.8",
-    "scikit-learn~=1.7",
-]
 exl3 = [
-    # ExLlamaV3 ships compiled CUDA kernels and exposes internals that
-    # change across releases (Module iteration, TransformerBlock
-    # .export_state, LinearEXL3.get_weight_tensor, Linear.lora_a/b_tensors).
-    # This code is audited against the 1.3.0 API (in practice installed as
-    # an editable local fork of exllamav3); PyPI may lag behind. Re-audit
-    # the internals above before bumping across major versions.
-    "exllamav3>=1.1.0",
+    # Source-audited against ExLlamaV3 1.5.4; CUDA validation is separate.
+    "exllamav3>=1.5.3,<1.6",
     "safetensors>=0.4",
 ]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.14.5",
-    "ty>=0.0.5",
+    "ruff>=0.16.9",
+    "ty>=0.0.84",
 ]
 
 [project.urls]
@@ -80,11 +67,34 @@ Changelog = "https://github.com/p-e-w/heretic/releases"
 heretic = "heretic.main:main"
 
 [build-system]
-requires = ["uv_build>=0.8.11,<0.9.0"]
+requires = ["uv_build>=0.12.21,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.ruff.lint.per-file-ignores]
+"src/heretic/main.py" = ["E402"]  # CLI help intentionally precedes heavyweight imports.
+
+[tool.ruff.lint]
+ignore = [
+    "B023",  # "Function definition does not bind loop variable"
+    "BLE001",  # "Do not catch blind exception"
+    "TRY002",  # "Create your own exception"
+    "SIM117",  # "Use a single `with` statement with multiple contexts instead of nested `with` statements"
+]
+
 [tool.uv]
-exclude-newer = "7 days"
+# TODO: Re-enable before 2.0 release!
+#exclude-newer = "7 days"
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[[tool.uv.index]]
+# Default to CPU wheels for PyTorch to avoid issues in CI.
+# Can be overridden by passing `--index pytorch=<url>` to uv.
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv.build-backend]
 module-name = "heretic"
