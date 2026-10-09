@@ -29,7 +29,12 @@ teacher-forced against those generations. This scorer ports that idea.
 ## What it computes
 
 1. Before optimization, the original model greedily answers the configured
-   prompts. The prompt + response token sequences are cached.
+   prompts. The response token ids are cached in memory and, by default, on
+   disk under `<study_checkpoint_dir>/self_calibrated_kl/`, keyed on the model,
+   the exact prompts and the generation settings, so later runs on the same
+   original model (further studies, `--evaluate-model` over many checkpoints)
+   skip generation. Greedy decoding makes the corpus deterministic, so reusing
+   it does not affect reproducibility.
 2. Its distribution at every response position is summarised as the `top_k`
    most likely tokens plus the total mass of everything else (one "tail"
    bucket).

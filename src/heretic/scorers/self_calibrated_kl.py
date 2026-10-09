@@ -36,9 +36,13 @@ captured by the tail bucket. Set `top_k = 0` to keep full distributions and
 compute the exact value.
 """
 
+import hashlib
+import json
 import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -98,6 +102,16 @@ class Settings(BaseModel):
         description=(
             "Number of sequences per teacher-forced forward pass "
             "(0 = derive from the vocabulary size and response length to bound memory use)."
+        ),
+    )
+
+    cache_dir: str | None = Field(
+        default=None,
+        description=(
+            "Directory where the generated reference responses are cached, keyed on the "
+            "model, the prompts and the generation settings, so that later runs on the same "
+            "original model skip generation (None = <study_checkpoint_dir>/self_calibrated_kl, "
+            "empty string = do not cache)."
         ),
     )
 
@@ -187,6 +201,65 @@ def position_kl_divergence(
     return kl + tail_term
 
 
+def response_cache_key(
+    model: str,
+    model_commit: str | None,
+    prompts: list[Prompt],
+    max_tokens: int,
+    response_prefix: str | None,
+    chat_template_kwargs: dict[str, Any],
+) -> str:
+    """
+    Content hash identifying a reference corpus: the original model, the exact
+    prompts (system and user text), and everything that shapes greedy generation.
+    """
+    payload = {
+        "model": model,
+        "model_commit": model_commit,
+        "prompts": [[prompt.system, prompt.user] for prompt in prompts],
+        "max_tokens": max_tokens,
+        "response_prefix": response_prefix,
+        "chat_template_kwargs": chat_template_kwargs,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_response_cache(path: Path, key: str) -> list[list[int]] | None:
+    """Return the cached response token IDs if `path` holds a corpus for `key`."""
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+        if data.get("key") != key:
+            return None
+        return [list(map(int, token_ids)) for token_ids in data["responses"]]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"[yellow]Ignoring unreadable response cache {path}: {error}[/]")
+        return None
+
+
+def save_response_cache(
+    path: Path,
+    key: str,
+    model: str,
+    prompts: list[Prompt],
+    responses: list[list[int]],
+    max_tokens: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "key": key,
+        "model": model,
+        "max_tokens": max_tokens,
+        "prompts": [{"system": p.system, "user": p.user} for p in prompts],
+        "responses": responses,
+    }
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False)
+
+
 def find_answer_start(
     response_token_ids: list[int],
     decode: Callable[[list[int]], str],
@@ -237,18 +310,12 @@ class SelfCalibratedKL(Scorer):
             self.settings.max_response_tokens
             or self.heretic_settings.max_response_length
         )
-        print(
-            f"* Generating reference responses with the original model (up to [bold]{max_tokens}[/] tokens each)..."
-        )
-        sequences: list[tuple[Prompt, list[int]]] = []
-        generation_batch_size = max(1, self.heretic_settings.batch_size)
-        for start in range(0, len(prompts), generation_batch_size):
-            batch = prompts[start : start + generation_batch_size]
-            for prompt, token_ids in zip(
-                batch, ctx.get_response_token_ids(batch, max_tokens)
-            ):
-                if token_ids:
-                    sequences.append((prompt, token_ids))
+        responses = self._load_or_generate_responses(ctx, prompts, max_tokens)
+        sequences = [
+            (prompt, token_ids)
+            for prompt, token_ids in zip(prompts, responses)
+            if token_ids
+        ]
 
         dropped = len(prompts) - len(sequences)
         if dropped:
@@ -324,6 +391,60 @@ class SelfCalibratedKL(Scorer):
                 f"of the original model's probability mass per position "
                 f"(minimum [bold]{100 * coverage.min():.2f}%[/])"
             )
+
+    def _cache_path(self, key: str) -> Path | None:
+        cache_dir = self.settings.cache_dir
+        if cache_dir is None:
+            cache_dir = str(
+                Path(self.heretic_settings.study_checkpoint_dir) / "self_calibrated_kl"
+            )
+        if not cache_dir:
+            return None
+        return Path(cache_dir) / f"{key[:16]}.json"
+
+    def _load_or_generate_responses(
+        self, ctx: Context, prompts: list[Prompt], max_tokens: int
+    ) -> list[list[int]]:
+        key = response_cache_key(
+            self.heretic_settings.model,
+            self.heretic_settings.model_commit,
+            prompts,
+            max_tokens,
+            self.heretic_settings.response_prefix,
+            self.heretic_settings.chat_template_kwargs,
+        )
+        path = self._cache_path(key)
+
+        if path is not None:
+            cached = load_response_cache(path, key)
+            if cached is not None and len(cached) == len(prompts):
+                print(f"* Loaded cached reference responses from [bold]{path}[/]")
+                return cached
+
+        print(
+            f"* Generating reference responses with the original model (up to [bold]{max_tokens}[/] tokens each)..."
+        )
+        responses: list[list[int]] = []
+        generation_batch_size = max(1, self.heretic_settings.batch_size)
+        for start in range(0, len(prompts), generation_batch_size):
+            batch = prompts[start : start + generation_batch_size]
+            responses.extend(ctx.get_response_token_ids(batch, max_tokens))
+
+        if path is not None:
+            try:
+                save_response_cache(
+                    path,
+                    key,
+                    self.heretic_settings.model,
+                    prompts,
+                    responses,
+                    max_tokens,
+                )
+                print(f"* Cached reference responses to [bold]{path}[/]")
+            except OSError as error:
+                print(f"  * [yellow]Could not write response cache {path}: {error}[/]")
+
+        return responses
 
     def _forward_batches(
         self,

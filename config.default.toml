@@ -252,6 +252,11 @@ batch_size = 0
 # reported separately for thinking and answer positions when a marker is found.
 answer_start_markers = ["</think>", "<|end_of_thought|>"]
 
+# Directory where the generated reference responses are cached (keyed on the model, the
+# prompts and the generation settings), so later runs on the same original model skip
+# generation. Defaults to <study_checkpoint_dir>/self_calibrated_kl; "" disables caching.
+# cache_dir = "checkpoints/self_calibrated_kl"
+
 # Dataset of prompts the original model answers to build the reference corpus.
 # Point this at prompts that resemble the model's real workload (chat, coding,
 # tool use, system prompts); a list of datasets is accepted (see above).

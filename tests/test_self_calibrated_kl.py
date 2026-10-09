@@ -3,7 +3,9 @@
 
 """CPU-only tests for the self-calibrated KL scorer and its backend helpers."""
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -160,6 +162,7 @@ class FakeContext:
             )
         )
         self.logit_calls = 0
+        self.generation_calls = 0
 
     def load_prompts(self, specification):
         return [Prompt(system="s", user=f"user {i}") for i in range(5)]
@@ -168,6 +171,7 @@ class FakeContext:
         return self._model
 
     def get_response_token_ids(self, prompts, max_new_tokens):
+        self.generation_calls += 1
         out = []
         for index, _ in enumerate(prompts):
             if index == 4:
@@ -190,6 +194,7 @@ class FakeContext:
 
 
 def make_scorer(**overrides):
+    overrides.setdefault("cache_dir", "")
     heretic_settings = IsolatedSettings(
         model="unused", batch_size=2, max_response_length=8
     )
@@ -245,6 +250,27 @@ class ScorerTests(unittest.TestCase):
         scorer.init(ctx)
         self.assertEqual(scorer._batch_size, 1)
         self.assertEqual(ctx.logit_calls, 4)
+
+    def test_reference_responses_are_cached_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scorer, settings = make_scorer(top_k=4, cache_dir=directory)
+            ctx = FakeContext(heretic_settings=settings)
+            scorer.init(ctx)
+            self.assertEqual(ctx.generation_calls, 3)
+            first = [r.response_token_ids for r in scorer._references]
+            self.assertEqual(len(list(Path(directory).glob("*.json"))), 1)
+
+            again, _ = make_scorer(top_k=4, cache_dir=directory)
+            ctx2 = FakeContext(heretic_settings=settings)
+            again.init(ctx2)
+            self.assertEqual(ctx2.generation_calls, 0)
+            self.assertEqual([r.response_token_ids for r in again._references], first)
+
+            # A different generation length is a different corpus.
+            other, _ = make_scorer(top_k=4, cache_dir=directory, max_response_tokens=3)
+            ctx3 = FakeContext(heretic_settings=settings)
+            other.init(ctx3)
+            self.assertEqual(ctx3.generation_calls, 3)
 
     def test_scorer_contract(self):
         SelfCalibratedKL.validate_contract()
