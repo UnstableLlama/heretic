@@ -29,6 +29,7 @@ from optuna.trial import FrozenTrial
 from psutil import Process
 from questionary import Question
 from rich.console import Console
+from torch import Tensor
 
 from .config import DatasetSpecification, Settings, SingleDatasetSpecification
 from .system import (
@@ -301,6 +302,74 @@ def is_dataset_specification_reproducible(specification: DatasetSpecification) -
 
 def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def trim_response_token_ids(
+    token_ids: list[int],
+    eos_token_ids: set[int],
+    pad_token_id: int | None,
+) -> list[int]:
+    """
+    Cut a generated token sequence after its first end-of-sequence token
+    (which is kept, because predicting it is part of the response), or strip
+    trailing padding when generation ran to the length limit without one.
+    """
+    for index, token_id in enumerate(token_ids):
+        if token_id in eos_token_ids:
+            return token_ids[: index + 1]
+
+    end = len(token_ids)
+    while end > 0 and pad_token_id is not None and token_ids[end - 1] == pad_token_id:
+        end -= 1
+
+    return token_ids[:end]
+
+
+def build_teacher_forced_batch(
+    prompt_token_ids: list[list[int]],
+    response_token_ids: list[list[int]],
+    pad_token_id: int,
+) -> tuple[Tensor, Tensor]:
+    """
+    Concatenate each prompt with its response and left-pad the rows to a
+    common length, so that the response always occupies the final positions
+    of its row. Returns `(input_ids, attention_mask)`.
+    """
+    rows = [
+        list(prompt) + list(response)
+        for prompt, response in zip(prompt_token_ids, response_token_ids)
+    ]
+    max_length = max(len(row) for row in rows)
+
+    input_ids = torch.full((len(rows), max_length), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((len(rows), max_length), dtype=torch.long)
+    for index, row in enumerate(rows):
+        input_ids[index, max_length - len(row) :] = torch.tensor(row, dtype=torch.long)
+        attention_mask[index, max_length - len(row) :] = 1
+
+    return input_ids, attention_mask
+
+
+def slice_response_logits(logits: Tensor, response_lengths: list[int]) -> list[Tensor]:
+    """
+    Given logits of shape `(batch, kept, vocabulary)` for the *last* `kept`
+    positions of rows built by `build_teacher_forced_batch`, return for each
+    row the `(response_length, vocabulary)` logits that predict its response
+    tokens. The logits predicting token `t` sit at position `t - 1`, so these
+    are the `response_length` positions ending one before the final position.
+    Works whether `kept` covers the whole row or only its tail, as long as
+    `kept >= response_length + 1`.
+    """
+    kept = logits.shape[1]
+    slices = []
+    for row, length in enumerate(response_lengths):
+        if kept < length + 1:
+            raise ValueError(
+                f"Need logits for at least {length + 1} positions to score a "
+                f"{length}-token response, got {kept}"
+            )
+        slices.append(logits[row, kept - 1 - length : kept - 1])
+    return slices
 
 
 def get_readme_intro(

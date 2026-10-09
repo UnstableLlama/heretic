@@ -228,6 +228,39 @@ split = "test[:100]"
 column = "text"
 
 
+# Per-token KL divergence from the original model, teacher-forced over responses
+# that the original model itself generated for the configured prompts ("self-calibration").
+# Unlike KLDivergence, which looks at the first response token only, this scores every
+# position of a realistic response. Enable it by adding
+#   { plugin = "heretic.scorers.self_calibrated_kl.SelfCalibratedKL", optimization = "minimize" }
+# to the scorers list above (and consider removing KLDivergence, or setting its
+# optimization to "none" to keep it as a reported-only score).
+[scorer.SelfCalibratedKL]
+# Maximum length of each reference response, in tokens (0 = use max_response_length).
+max_response_tokens = 0
+
+# Number of most likely tokens of the original model's distribution kept at each position;
+# the remaining mass is tracked as a single tail bucket, which makes the score a tight lower
+# bound on the exact KL divergence. 0 keeps full distributions (exact, but memory-hungry).
+top_k = 1024
+
+# Number of sequences per teacher-forced forward pass (0 = derive from the vocabulary size
+# and response length so that the transient logits stay within a few gigabytes).
+batch_size = 0
+
+# Strings marking the end of a reasoning span. The per-token KL divergence is additionally
+# reported separately for thinking and answer positions when a marker is found.
+answer_start_markers = ["</think>", "<|end_of_thought|>"]
+
+# Dataset of prompts the original model answers to build the reference corpus.
+# Point this at prompts that resemble the model's real workload (chat, coding,
+# tool use, system prompts); a list of datasets is accepted (see above).
+[scorer.SelfCalibratedKL.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+
 [scorer.BenchmarkScore]
 # Name that describes what the configured benchmark score measures.
 score_name = "PIQA acc_norm"

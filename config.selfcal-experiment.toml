@@ -1,0 +1,79 @@
+# Measurement configuration for the self-calibrated KL experiment.
+#
+# Scores an already modified model against its original with four KL variants,
+# changing prompt domain and token coverage independently:
+#
+#                      | first token only   | every response token
+#   Alpaca prompts     | KLDivergence       | SelfCalibratedKL - alpaca
+#   in-domain prompts  | KLDivergence - domain | SelfCalibratedKL - domain
+#
+# Usage:
+#   heretic --config config.selfcal-experiment.toml \
+#           --model <original model> --evaluate-model <modified model>
+#
+# Baselines (and the reference corpus) are computed on the original model, then
+# the modified model is loaded and scored. Add a BenchmarkScore entry to also
+# record a capability benchmark for the same checkpoint, so that the KL variants
+# can be correlated against actual capability loss across several checkpoints.
+#
+# The in-domain prompt sets below are suggestions: swap in whatever resembles the
+# workload the model is actually used for, and verify the split/column names of
+# any dataset before running.
+
+scorers = [
+    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "minimize" },
+    { plugin = "heretic.scorers.kl_divergence.KLDivergence", optimization = "none", instance_name = "domain" },
+    { plugin = "heretic.scorers.self_calibrated_kl.SelfCalibratedKL", optimization = "none", instance_name = "alpaca" },
+    { plugin = "heretic.scorers.self_calibrated_kl.SelfCalibratedKL", optimization = "none", instance_name = "domain" },
+    # { plugin = "heretic.scorers.benchmark_score.BenchmarkScore", optimization = "none" },
+]
+
+# Longer responses than the default 100 tokens, so that thinking models get past
+# their reasoning span and the answer positions are actually scored.
+max_response_length = 512
+
+[scorer.SelfCalibratedKL]
+top_k = 1024
+
+# --- Alpaca cells (default KLDivergence prompts and SelfCalibratedKL_alpaca) ---
+
+[scorer.SelfCalibratedKL_alpaca.prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:100]"
+column = "text"
+
+# --- In-domain cells: a mix of chat, math and coding prompts ---
+
+[[scorer.KLDivergence_domain.prompts]]
+dataset = "HuggingFaceH4/ultrachat_200k"
+split = "test_sft[:40]"
+column = "prompt"
+
+[[scorer.KLDivergence_domain.prompts]]
+dataset = "openai/gsm8k"
+config = "main"
+split = "test[:30]"
+column = "question"
+
+[[scorer.KLDivergence_domain.prompts]]
+dataset = "openai/openai_humaneval"
+split = "test[:30]"
+column = "prompt"
+prefix = "Complete the following Python function."
+
+[[scorer.SelfCalibratedKL_domain.prompts]]
+dataset = "HuggingFaceH4/ultrachat_200k"
+split = "test_sft[:40]"
+column = "prompt"
+
+[[scorer.SelfCalibratedKL_domain.prompts]]
+dataset = "openai/gsm8k"
+config = "main"
+split = "test[:30]"
+column = "question"
+
+[[scorer.SelfCalibratedKL_domain.prompts]]
+dataset = "openai/openai_humaneval"
+split = "test[:30]"
+column = "prompt"
+prefix = "Complete the following Python function."

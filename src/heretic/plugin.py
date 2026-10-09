@@ -176,6 +176,28 @@ class Context:
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
         return self._model.get_residuals_batched(prompts)
 
+    def get_response_token_ids(
+        self, prompts: list[Prompt], max_new_tokens: int
+    ) -> list[list[int]]:
+        """
+        Greedily generate a response for each prompt and return the generated
+        token IDs (prompt excluded, first end-of-sequence token included).
+        Not batched: pass at most a batch worth of prompts at a time.
+        """
+        return self._model.get_response_token_ids(prompts, max_new_tokens)
+
+    def get_response_logits(
+        self, prompts: list[Prompt], response_token_ids: list[list[int]]
+    ) -> list[Tensor]:
+        """
+        Teacher-forced forward pass over each prompt followed by the given
+        response tokens. Returns, per prompt, the raw `(response_length, vocabulary)`
+        logits at the positions that predict the response tokens. Not batched,
+        and the full-vocabulary logits of a batch are large: keep batches small
+        and reduce the result before requesting the next one.
+        """
+        return self._model.get_response_logits(prompts, response_token_ids)
+
     def get_model(self) -> Model:
         """
         Prefer managed methods (`get_responses` etc.) unless you

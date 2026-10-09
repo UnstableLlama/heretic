@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import inspect
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, TypeAlias, cast
@@ -29,7 +30,15 @@ from transformers.generation import (
 
 from .config import QuantizationMethod, Settings
 from .system import empty_cache
-from .utils import Prompt, batchify, format_exception, print
+from .utils import (
+    Prompt,
+    batchify,
+    build_teacher_forced_batch,
+    format_exception,
+    print,
+    slice_response_logits,
+    trim_response_token_ids,
+)
 
 
 def get_model_class(
@@ -443,11 +452,7 @@ class Model:
 
         return sorted(components)
 
-    def generate(
-        self,
-        prompts: list[Prompt],
-        **kwargs: Any,
-    ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+    def _render_chat_prompts(self, prompts: list[Prompt]) -> list[str]:
         chats = [
             [
                 {"role": "system", "content": prompt.system},
@@ -474,6 +479,15 @@ class Model:
             chat_prompts = [
                 prompt + self.settings.response_prefix for prompt in chat_prompts
             ]
+
+        return chat_prompts
+
+    def generate(
+        self,
+        prompts: list[Prompt],
+        **kwargs: Any,
+    ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
+        chat_prompts = self._render_chat_prompts(prompts)
 
         inputs = self.tokenizer(
             chat_prompts,
@@ -794,6 +808,116 @@ class Model:
             logits.append(self.get_logits(batch))
 
         return torch.cat(logits, dim=0)
+
+    def _eos_token_ids(self) -> set[int]:
+        eos_token_ids: set[int] = set()
+
+        generation_config = getattr(self.model, "generation_config", None)
+        eos = getattr(generation_config, "eos_token_id", None)
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+
+        if isinstance(eos, int):
+            eos_token_ids.add(eos)
+        elif eos is not None:
+            eos_token_ids.update(int(token_id) for token_id in eos)
+
+        return eos_token_ids
+
+    def get_response_token_ids(
+        self,
+        prompts: list[Prompt],
+        max_new_tokens: int,
+    ) -> list[list[int]]:
+        """
+        Greedily generate a response for each prompt and return the generated
+        token IDs (without the prompt), cut after the first end-of-sequence token.
+        """
+        inputs, outputs = self.generate(prompts, max_new_tokens=max_new_tokens)
+
+        # This cast is valid because the input_ids property is a Tensor
+        # if the tokenizer is invoked with return_tensors="pt".
+        prompt_length = cast(Tensor, inputs["input_ids"]).shape[1]
+        generated = cast(Tensor, outputs)[:, prompt_length:].tolist()
+
+        eos_token_ids = self._eos_token_ids()
+        return [
+            trim_response_token_ids(
+                token_ids, eos_token_ids, self.tokenizer.pad_token_id
+            )
+            for token_ids in generated
+        ]
+
+    def _forward_accepts_logits_to_keep(self) -> bool:
+        if not hasattr(self, "_accepts_logits_to_keep"):
+            try:
+                parameters = inspect.signature(self.model.forward).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            self._accepts_logits_to_keep = "logits_to_keep" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        return self._accepts_logits_to_keep
+
+    def get_response_logits(
+        self,
+        prompts: list[Prompt],
+        response_token_ids: list[list[int]],
+    ) -> list[Tensor]:
+        """
+        Teacher-forced forward pass over each prompt followed by the given
+        response tokens. Returns, for each prompt, the raw logits of shape
+        `(response_length, vocabulary)` at the positions that predict the
+        response tokens. The tensors are views into one batch tensor on the
+        model's device; callers should reduce them before requesting the
+        next batch.
+        """
+        chat_prompts = self._render_chat_prompts(prompts)
+
+        encoded = self.tokenizer(
+            chat_prompts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+        )
+        prompt_token_ids = [
+            token_ids[mask.bool()].tolist()
+            for token_ids, mask in zip(
+                cast(Tensor, encoded["input_ids"]),
+                cast(Tensor, encoded["attention_mask"]),
+            )
+        ]
+
+        pad_token_id = self.tokenizer.pad_token_id
+        assert pad_token_id is not None
+        input_ids, attention_mask = build_teacher_forced_batch(
+            prompt_token_ids, response_token_ids, pad_token_id
+        )
+        # Plain forward passes do not derive positions from the attention mask
+        # the way generate() does, so left padding must be compensated explicitly.
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+
+        response_lengths = [len(token_ids) for token_ids in response_token_ids]
+        kept = max(response_lengths) + 1
+
+        extra_kwargs: dict[str, Any] = {}
+        if self._forward_accepts_logits_to_keep():
+            # Only materialize the logits we need: the full-vocabulary logits of a
+            # long batch are by far the largest tensor in this computation.
+            extra_kwargs["logits_to_keep"] = kept
+
+        device = self.model.device
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids=input_ids.to(device),
+                attention_mask=attention_mask.to(device),
+                position_ids=position_ids.to(device),
+                use_cache=False,
+                **extra_kwargs,
+            )
+
+        return slice_response_logits(outputs.logits, response_lengths)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
         # This cast is valid because str is the return type

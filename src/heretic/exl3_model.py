@@ -65,7 +65,13 @@ from .modifiers.ara import Parameters as ARAParameters
 from .modifiers.ara import Settings as ARASettings
 from .modifiers.ara import mean_distances_to_knn
 from .system import empty_cache
-from .utils import Prompt, batchify, print
+from .utils import (
+    Prompt,
+    batchify,
+    build_teacher_forced_batch,
+    print,
+    slice_response_logits,
+)
 
 # Match keys like:
 #   model.layers.<N>.self_attn.o_proj                     (standard)
@@ -1200,24 +1206,7 @@ class Exl3Model:
     # ------------------------------------------------------------------
 
     def _tokenize_chat(self, prompts: list[Prompt]) -> Tensor:
-        chats = [
-            [
-                {"role": "system", "content": prompt.system},
-                {"role": "user", "content": prompt.user},
-            ]
-            for prompt in prompts
-        ]
-        chat_prompts = cast(
-            list[str],
-            self.tokenizer.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=False,
-                **self.settings.chat_template_kwargs,
-            ),
-        )
-        if self.settings.response_prefix:
-            chat_prompts = [p + self.settings.response_prefix for p in chat_prompts]
+        chat_prompts = self._render_chat_prompts(prompts)
 
         # Use the HF tokenizer for left-padded batch tokenization. We feed
         # raw input_ids to exllamav3.Model.forward; no attention mask is
@@ -1243,11 +1232,17 @@ class Exl3Model:
         input_ids: Tensor,
         *,
         last_only: bool = False,
+        last_tokens: int | None = None,
         capture_residuals: bool = False,
     ) -> tuple[Tensor, list[Tensor]]:
         """Run a single forward pass. Returns (logits, export_states)
         where logits is (B, T_out, vocab) and export_states is a list of
         (B, T, H) tensors (one per captured point: embed-out + per-block).
+
+        ``last_only`` keeps only the final position's logits; ``last_tokens``
+        keeps the final N positions (exllamav3 slices the hidden state right
+        before the LM head, so earlier positions never reach the vocabulary
+        projection).
 
         Note: this is a fresh, stateless forward — we hand the model a
         new params dict each call. The Cache may accumulate, but for
@@ -1258,6 +1253,8 @@ class Exl3Model:
         params: dict[str, Any] = {}
         if last_only:
             params["last_tokens_only"] = 1
+        elif last_tokens is not None:
+            params["last_tokens_only"] = int(last_tokens)
         if capture_residuals:
             params["capture_residuals"] = True
         with torch.inference_mode():
@@ -1348,6 +1345,89 @@ class Exl3Model:
         for batch in batchify(prompts, self.settings.batch_size):
             out.append(self.get_logits(batch))
         return torch.cat(out, dim=0)
+
+    def get_response_token_ids(
+        self,
+        prompts: list[Prompt],
+        max_new_tokens: int,
+    ) -> list[list[int]]:
+        """Greedily generate a response per prompt and return its token IDs.
+
+        exllamav3's convenience generator returns text, so the completion is
+        re-tokenized with the HF tokenizer (special tokens kept). The stop
+        token itself is not part of the returned text; when generation ended
+        on it, the tokenizer's EOS id is appended so that the end of the
+        response is a scored position, matching the HF backend.
+        """
+        chat_prompts = self._render_chat_prompts(prompts)
+        completions, results = self._ensure_generator().generate(
+            prompt=chat_prompts,
+            max_new_tokens=max_new_tokens,
+            completion_only=True,
+            add_bos=False,
+            encode_special_tokens=True,
+            decode_special_tokens=True,
+            sampler=self._greedy_sampler(),
+            seed=0,
+            return_last_results=True,
+        )
+        if isinstance(completions, str):
+            completions = [completions]
+            results = [results]
+
+        hf = self.tokenizer._ensure_hf()
+        eos_token_id = hf.eos_token_id
+        response_token_ids: list[list[int]] = []
+        for completion, result in zip(completions, results):
+            token_ids = list(hf.encode(completion, add_special_tokens=False))
+            ended_on_stop_token = (
+                bool(result) and result.get("eos_reason") == "stop_token"
+            )
+            if ended_on_stop_token and eos_token_id is not None:
+                token_ids.append(int(eos_token_id))
+            response_token_ids.append(token_ids)
+        return response_token_ids
+
+    def get_response_logits(
+        self,
+        prompts: list[Prompt],
+        response_token_ids: list[list[int]],
+    ) -> list[Tensor]:
+        """Teacher-forced logits at the positions predicting each response token.
+
+        Returns one ``(response_length, vocab)`` view per prompt into a single
+        batch tensor. Rows are left-padded like every other forward in this
+        backend; only the final ``max(response_length) + 1`` positions are
+        projected to the vocabulary.
+        """
+        chat_prompts = self._render_chat_prompts(prompts)
+        hf = self.tokenizer._ensure_hf()
+        encoded = hf(
+            chat_prompts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+        )
+        prompt_token_ids = [
+            token_ids[mask.bool()].tolist()
+            for token_ids, mask in zip(encoded["input_ids"], encoded["attention_mask"])
+        ]
+
+        pad_token_id = hf.pad_token_id if hf.pad_token_id is not None else 0
+        input_ids, _ = build_teacher_forced_batch(
+            prompt_token_ids, response_token_ids, pad_token_id
+        )
+        response_lengths = [len(token_ids) for token_ids in response_token_ids]
+
+        logits, _ = self._forward(input_ids, last_tokens=max(response_lengths) + 1)
+
+        # exllamav3 may pad the LM head's output dimension; drop any padding
+        # columns so the softmax only ranges over real vocabulary entries.
+        vocab_size = getattr(self.config, "vocab_size", None)
+        if isinstance(vocab_size, int) and logits.shape[-1] > vocab_size:
+            logits = logits[..., :vocab_size]
+
+        return slice_response_logits(logits, response_lengths)
 
     # ------------------------------------------------------------------
     # Generation
