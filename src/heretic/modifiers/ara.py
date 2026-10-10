@@ -84,6 +84,17 @@ class Settings(BaseModel):
     )
     steer_bad_behavior_weight_min: float = Field(default=0.0001, gt=0)
     steer_bad_behavior_weight_max: float = Field(default=1.0, gt=0)
+    overcorrect_relative_weight_max: float = Field(
+        default=1.3,
+        ge=0,
+        description=(
+            "Upper bound of the search range for overcorrect_relative_weight. "
+            "The steering loss is the distance of the modified bad outputs from the good "
+            "outputs minus this weight times their distance from the original bad outputs; "
+            "for weights above 1.0 it is unbounded below and the LoRA optimisation diverges. "
+            "Set this to 1.0 to exclude that region from the search."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_steering_range(self) -> "Settings":
@@ -254,7 +265,7 @@ class ARA(Modifier[Parameters]):
         overcorrect_relative_weight = trial.suggest_float(
             "overcorrect_relative_weight",
             0.0,
-            1.3,
+            self.settings.overcorrect_relative_weight_max,
         )
         neighbor_count = trial.suggest_int(
             "neighbor_count",
