@@ -173,7 +173,8 @@ class FakeContext:
     def get_response_token_ids(self, prompts, max_new_tokens):
         self.generation_calls += 1
         out = []
-        for index, _ in enumerate(prompts):
+        for prompt in prompts:
+            index = int(prompt.user.split()[-1])
             if index == 4:
                 out.append([])  # empty response: must be dropped
             else:
