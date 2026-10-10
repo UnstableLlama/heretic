@@ -455,15 +455,25 @@ class SelfCalibratedKL(Scorer):
         Yield `(batch, logits)` pairs for the given `(prompt, response_token_ids)`
         sequences, choosing the batch size from the first batch when unset.
         """
+        if self._batch_size is None:
+            # Probe with a single sequence to size the batches, then discard the
+            # result so that the baseline and every trial see *identical*
+            # batches. Backends without an attention mask (EXL3) let padding
+            # influence the logits, so a different first batch would otherwise
+            # register as divergence even between identical weights.
+            probe_prompt, probe_token_ids = sequences[0]
+            probe_logits = ctx.get_response_logits([probe_prompt], [probe_token_ids])
+            self._batch_size = self._choose_batch_size(probe_logits[0])
+            del probe_logits
+            empty_cache()
+
         index = 0
         while index < len(sequences):
-            batch = sequences[index : index + (self._batch_size or 1)]
+            batch = sequences[index : index + self._batch_size]
             logits = ctx.get_response_logits(
                 [prompt for prompt, _ in batch],
                 [token_ids for _, token_ids in batch],
             )
-            if self._batch_size is None:
-                self._batch_size = self._choose_batch_size(logits[0])
             yield batch, logits
             index += len(batch)
 

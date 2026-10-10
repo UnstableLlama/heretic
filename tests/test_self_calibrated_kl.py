@@ -438,6 +438,44 @@ class Exl3BackendTests(unittest.TestCase):
         )
         kwargs = generator.generate.call_args.kwargs
         self.assertTrue(kwargs["return_last_results"])
+        # Without explicit stop conditions exllamav3 never stops on EOS.
+        self.assertEqual(kwargs["stop_conditions"], [2])
+
+    def test_reset_model_reloads_when_model_path_changes(self):
+        from heretic.exl3_model import Exl3Model
+
+        model = Exl3Model.__new__(Exl3Model)
+        model.settings = IsolatedSettings(model="/other/model", quantization="exl3")
+        model._loaded_model_path = "/loaded/model"
+        model._reload_model = Mock()
+        self.assertFalse(model.reset_model())
+        model._reload_model.assert_called_once_with()
+
+    def test_get_response_token_ids_appends_triggering_stop_token(self):
+        from heretic.exl3_model import Exl3Model
+
+        model = Exl3Model.__new__(Exl3Model)
+        model.settings = IsolatedSettings(model="unused", quantization="exl3")
+        model.config = SimpleNamespace(eos_token_id=2, eos_token_id_list=[2, 9])
+        generator = Mock()
+        generator.generate.return_value = (
+            ["hello"],
+            [{"eos_reason": "stop_token", "eos_triggering_token_id": 9}],
+        )
+        model._ensure_generator = Mock(return_value=generator)
+        model._render_chat_prompts = Mock(return_value=["p1"])
+        model._greedy_sampler = Mock(return_value="greedy")
+        hf = SimpleNamespace(
+            eos_token_id=2,
+            encode=lambda text, add_special_tokens=False: [len(text)],
+        )
+        model.tokenizer = SimpleNamespace(_ensure_hf=lambda: hf, eos_token_id=2)
+        self.assertEqual(
+            model.get_response_token_ids([Prompt(system="", user="x")], 16),
+            [[5, 9]],
+        )
+        kwargs = generator.generate.call_args.kwargs
+        self.assertEqual(kwargs["stop_conditions"], [2, 9])
         self.assertTrue(kwargs["decode_special_tokens"])
 
 

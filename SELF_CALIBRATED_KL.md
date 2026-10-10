@@ -80,9 +80,13 @@ coverage independently:
 | Alpaca prompts    | `KLDivergence`         | `SelfCalibratedKL - alpaca` |
 | in-domain prompts | `KLDivergence - domain`| `SelfCalibratedKL - domain` |
 
+Heretic reads its settings from `config.toml` in the working directory (there
+is no `--config` flag), so run it from a directory where the experiment config
+is named `config.toml`:
+
 ```
-heretic --config config.selfcal-experiment.toml \
-        --model <original> --evaluate-model <modified>
+mkdir selfcal && cp config.selfcal-experiment.toml selfcal/config.toml && cd selfcal
+heretic --model <original> --evaluate-model <modified>
 ```
 
 Run it over several checkpoints spanning the damage range (a few Pareto-front

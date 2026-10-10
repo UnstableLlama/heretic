@@ -257,6 +257,7 @@ class Exl3Model:
         )
 
         model_path = str(Path(settings.model).expanduser())
+        self._loaded_model_path = model_path
         self.config = self._exl_api["Config"].from_directory(model_path)
         self.model = self._exl_api["Model"].from_config(self.config)
 
@@ -903,7 +904,18 @@ class Exl3Model:
         """Zero all LoRA contributions. The current model stays loaded; no
         weight reload is necessary because abliteration happens entirely
         through the additive LoRA path.
+
+        If ``settings.model`` no longer names the loaded directory (the
+        ``--evaluate-model`` path in ``main.py`` swaps it after the baselines
+        are computed), the current weights are unloaded and the new model is
+        loaded in their place, mirroring the HF backend's slow path. Returns
+        False in that case.
         """
+        new_path = str(Path(self.settings.model).expanduser())
+        if new_path != getattr(self, "_loaded_model_path", new_path):
+            self._reload_model()
+            return False
+
         self._invalidate_generator()
         for per_layer in self._layer_modules:
             for modules in per_layer.values():
@@ -912,6 +924,19 @@ class Exl3Model:
                     module.lora_b_tensors[self._lora_key].zero_()
 
         return True
+
+    def _reload_model(self) -> None:
+        """Unload the current weights and load ``settings.model`` from scratch."""
+        self._invalidate_generator()
+        self._generator = None
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "unload"):
+            model.unload()
+        self.model = cast(Any, None)
+        self.cache = cast(Any, None)
+        self._layer_modules = []
+        empty_cache()
+        self.__init__(self.settings, inspect_only=self._inspect_only)
 
     # ------------------------------------------------------------------
     # ARA: module I/O capture + ARA LoRA optimisation
@@ -1356,8 +1381,8 @@ class Exl3Model:
         exllamav3's convenience generator returns text, so the completion is
         re-tokenized with the HF tokenizer (special tokens kept). The stop
         token itself is not part of the returned text; when generation ended
-        on it, the tokenizer's EOS id is appended so that the end of the
-        response is a scored position, matching the HF backend.
+        on it, that token's id is appended so that the end of the response is
+        a scored position, matching the HF backend.
         """
         chat_prompts = self._render_chat_prompts(prompts)
         completions, results = self._ensure_generator().generate(
@@ -1368,6 +1393,7 @@ class Exl3Model:
             encode_special_tokens=True,
             decode_special_tokens=True,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
             return_last_results=True,
         )
@@ -1383,8 +1409,13 @@ class Exl3Model:
             ended_on_stop_token = (
                 bool(result) and result.get("eos_reason") == "stop_token"
             )
-            if ended_on_stop_token and eos_token_id is not None:
-                token_ids.append(int(eos_token_id))
+            if ended_on_stop_token:
+                # Prefer the token that actually ended generation (e.g. a chat
+                # turn terminator such as <|eot|>), falling back to the
+                # tokenizer's EOS id.
+                stop_token_id = result.get("eos_triggering_token_id", eos_token_id)
+                if stop_token_id is not None:
+                    token_ids.append(int(stop_token_id))
             response_token_ids.append(token_ids)
         return response_token_ids
 
@@ -1450,6 +1481,35 @@ class Exl3Model:
                 tokenizer=Tokenizer.from_config(self.config),
             )
         return self._generator
+
+    def _stop_token_ids(self) -> list[int]:
+        """Every end-of-sequence token id the model may emit.
+
+        exllamav3's convenience generator installs *no* stop tokens unless
+        ``stop_conditions`` is given, so without this a chat model keeps
+        generating past its turn terminator until ``max_new_tokens``. The
+        exllamav3 config carries ``eos_token_id_list`` (config.json plus
+        generation_config.json, merged by its Tokenizer); the HF tokenizer's
+        EOS is added for good measure.
+        """
+        ids: list[int] = []
+        config = getattr(self, "config", None)
+        for candidate in (
+            getattr(config, "eos_token_id_list", None),
+            getattr(config, "eos_token_id", None),
+        ):
+            if candidate is None:
+                continue
+            for token_id in candidate if isinstance(candidate, list) else [candidate]:
+                if isinstance(token_id, int) and token_id not in ids:
+                    ids.append(token_id)
+        tokenizer = getattr(self, "tokenizer", None)
+        hf_eos = getattr(tokenizer, "eos_token_id", None)
+        if hf_eos is None and hasattr(tokenizer, "_ensure_hf"):
+            hf_eos = getattr(tokenizer._ensure_hf(), "eos_token_id", None)
+        if isinstance(hf_eos, int) and hf_eos not in ids:
+            ids.append(hf_eos)
+        return ids
 
     def _greedy_sampler(self) -> Any:
         """Return a GreedySampler instance. Mirrors HF's do_sample=False
@@ -1518,6 +1578,7 @@ class Exl3Model:
             add_bos=False,
             encode_special_tokens=True,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
         )
         if isinstance(completions, str):
@@ -1543,6 +1604,7 @@ class Exl3Model:
             encode_special_tokens=True,
             decode_special_tokens=not skip_special_tokens,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
         )
         return [responses] if isinstance(responses, str) else responses
@@ -1581,6 +1643,7 @@ class Exl3Model:
             add_bos=False,
             encode_special_tokens=True,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
         )
         if isinstance(completion, list):

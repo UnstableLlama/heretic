@@ -7,9 +7,9 @@
 #   Alpaca prompts     | KLDivergence       | SelfCalibratedKL - alpaca
 #   in-domain prompts  | KLDivergence - domain | SelfCalibratedKL - domain
 #
-# Usage:
-#   heretic --config config.selfcal-experiment.toml \
-#           --model <original model> --evaluate-model <modified model>
+# Usage (heretic reads config.toml from the working directory; there is no --config flag):
+#   mkdir selfcal && cp config.selfcal-experiment.toml selfcal/config.toml && cd selfcal
+#   heretic --model <original model> --evaluate-model <modified model>
 #
 # Baselines (and the reference corpus) are computed on the original model, then
 # the modified model is loaded and scored. Add a BenchmarkScore entry to also
