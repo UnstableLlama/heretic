@@ -111,6 +111,47 @@ _ARA_MOE_MAX_SAMPLES = 64
 # and would give the k-NN objective a degenerate fit; skip it (slot stays zero).
 _ARA_MIN_SAMPLES = 2
 
+# Row-chunk budget (bytes of fp32) for the chunked W^T A product below.
+_CHUNKED_WTA_BUDGET = 64 << 20
+
+
+class _ChunkedWtA(torch.autograd.Function):
+    """W^T @ A for a low-precision (in, out) W and fp32 (in, rank) A.
+
+    Upcasts W in row chunks so no full fp32 copy of W ever exists, and saves
+    only the low-precision W for backward (grad_A = W @ grad_out, also
+    chunked). Output is fp32 (out, rank). W is treated as a constant.
+    """
+
+    @staticmethod
+    def _rows(W: Tensor) -> int:
+        return max(1, _CHUNKED_WTA_BUDGET // (W.shape[1] * 4))
+
+    @staticmethod
+    def forward(ctx, W: Tensor, A: Tensor) -> Tensor:
+        ctx.save_for_backward(W)
+        out = torch.zeros(
+            (W.shape[1], A.shape[1]), dtype=torch.float32, device=A.device
+        )
+        step = _ChunkedWtA._rows(W)
+        for i in range(0, W.shape[0], step):
+            out.addmm_(W[i : i + step].float().T, A[i : i + step])
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        (W,) = ctx.saved_tensors
+        grad_A = torch.empty(
+            (W.shape[0], grad_out.shape[1]),
+            dtype=torch.float32,
+            device=grad_out.device,
+        )
+        step = _ChunkedWtA._rows(W)
+        for i in range(0, W.shape[0], step):
+            torch.mm(W[i : i + step].float(), grad_out, out=grad_A[i : i + step])
+        return None, grad_A
+
+
 # Abort the capture pass if system memory use crosses this percentage. Insurance
 # against a future capture bug re-triggering the creep-of-death; with the
 # bounded reservoir above, normal runs stay far below it.
@@ -1162,18 +1203,38 @@ class Exl3Model:
                     normalize = settings.preserve_row_magnitudes
                     if normalize:
                         W_base = self._dequantize_weight(module).to(device)
-                        W_row_norms = LA.vector_norm(
-                            W_base, dim=0, keepdim=True
-                        ).detach()
+                        # EXL3 convention: W is (in, out), forward is x @ W, so
+                        # the per-output norms are column norms (dim=0).
+                        W_row_norms = (
+                            LA.vector_norm(W_base, dim=0, keepdim=True).float().detach()
+                        )
+                        W_sq = (W_row_norms**2).detach()  # (1, out)
+                        # Low-precision copy for the W^T A product; the fp32
+                        # dequantized weight is freed right away.
+                        W_lp = W_base[:in_u, :out_u].to(torch.float16).contiguous()
+                        del W_base
 
                     def objective(A: Tensor, B: Tensor) -> Tensor:
                         if normalize:
-                            # EXL3 convention: W is (in, out), forward is x @ W.
-                            W_eff = W_base + A @ B
-                            # Column-wise normalisation (dim=0) because W is (in, out).
-                            W_eff = F.normalize(W_eff, p=2, dim=0) * W_row_norms
-                            new_good_output = good_input @ W_eff
-                            new_bad_output = bad_input @ W_eff
+                            # Exact column norms of W_eff = W + A@B without
+                            # building the (in, out) matrix:
+                            #   ||W_j + (A@B)_j||^2 = ||W_j||^2
+                            #       + 2 * sum_r (W^T A)_{jr} B_{rj}
+                            #       + sum_r B_{rj} ((A^T A) B)_{rj}
+                            # Only (out, rank) and (rank, rank) tensors enter
+                            # autograd; W^T A is computed in row chunks from
+                            # the fp16 copy (see _ChunkedWtA).
+                            WtA = _ChunkedWtA.apply(W_lp, A)  # (out, rank)
+                            cross = 2.0 * (WtA * B.T).sum(dim=1)  # (out,)
+                            AtA = A.T @ A  # (rank, rank)
+                            quad = (B * (AtA @ B)).sum(dim=0)  # (out,)
+                            col_norm_sq = W_sq + cross + quad
+                            col_norm = col_norm_sq.clamp_min(1e-12).sqrt()
+                            scale = W_row_norms / col_norm  # (1, out)
+                            new_good_output = (
+                                good_output + (good_input @ A) @ B
+                            ) * scale
+                            new_bad_output = (bad_output + (bad_input @ A) @ B) * scale
                         else:
                             # Factored form. The captured *_output is the module's
                             # original output (LoRA was zero at capture), so
