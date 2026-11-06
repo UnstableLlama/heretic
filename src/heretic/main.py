@@ -395,9 +395,28 @@ def run():
             return
 
         if action == "continue":
+            cli_settings = settings
             settings = Settings.model_validate_json(
                 existing_study.user_attrs["settings"]
             )
+            # The checkpoint fixes everything that defines the study, but the
+            # flags that only steer this invocation's interactive flow must
+            # come from the current command line (e.g. a non-interactive
+            # `--trial-index N --model-action save --save-directory DIR`).
+            for field in (
+                "checkpoint_action",
+                "trial_index",
+                "n_additional_trials",
+                "model_action",
+                "export_strategy",
+                "save_directory",
+                "upload_repo_id",
+                "upload_repo_private",
+                "upload_reproducibility_information",
+            ):
+                value = getattr(cli_settings, field)
+                if value is not None:
+                    setattr(settings, field, value)
         elif action == "restart":
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
