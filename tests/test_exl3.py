@@ -142,7 +142,8 @@ class Exl3Tests(unittest.TestCase):
         for trim, width in [(True, 2), (False, 4)]:
             model, module = backend(trim)
             model.apply_lora(3)
-            self.assertEqual(module.lora_a_tensors[model._lora_key].shape, (4, 3))
+            # exllamav3 stores A as (rank, in_padded) and B as (rank, out).
+            self.assertEqual(module.lora_a_tensors[model._lora_key].shape, (3, 4))
             self.assertEqual(module.lora_b_tensors[model._lora_key].shape, (3, width))
 
     def test_directional_update_matches_dense_reference(self):
@@ -156,10 +157,12 @@ class Exl3Tests(unittest.TestCase):
         expected = (
             -0.7 * (module.inner.weight[:3, :2].float() @ v)[:, None] @ v[None, :]
         )
+        # The forward applies x @ a.T @ b; the delta on the unpadded (in, out)
+        # weight is a.T @ b, and the padded input column stays zero.
         torch.testing.assert_close(
-            (a @ b)[:3].float(), expected, atol=0.001, rtol=0.001
+            (a.T @ b)[:3].float(), expected, atol=0.001, rtol=0.001
         )
-        self.assertTrue((a[3] == 0).all())
+        self.assertTrue((a[:, 3] == 0).all())
 
     def test_sliced_reconstruction_uses_contiguous_final_slice(self):
         model, _ = backend()
@@ -279,9 +282,10 @@ class Exl3Tests(unittest.TestCase):
             module.lora_a_tensors[model._lora_key],
             module.lora_b_tensors[model._lora_key],
         )
-        self.assertTrue(torch.isfinite(a @ b).all())
-        self.assertGreater((a @ b).abs().sum().item(), 0)
-        self.assertTrue((a[3] == 0).all())
+        self.assertEqual(tuple(a.shape), (2, 4))
+        self.assertTrue(torch.isfinite(a.T @ b).all())
+        self.assertGreater((a.T @ b).abs().sum().item(), 0)
+        self.assertTrue((a[:, 3] == 0).all())
 
     def test_knn_caps_neighbors_for_sparse_experts(self):
         torch.testing.assert_close(

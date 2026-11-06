@@ -17,10 +17,12 @@ Design notes:
 * LoRA injection bypasses exllamav3's ``LoRA`` class (which only loads
   from a PEFT directory). Each target ``Linear`` has plain
   ``lora_a_tensors`` / ``lora_b_tensors`` dicts keyed by any hashable; the
-  forward path applies ``output += input @ A @ B`` for each pair. We use
-  a sentinel object as the key, pre-allocate fp16 A/B tensors of shape
-  ``(in_features, 1)`` / ``(1, out_features)``, and mutate them in place
-  between trials.
+  forward path applies ``output += input @ A.T @ B`` for each pair, with
+  A stored in PEFT's ``(rank, in_features)`` orientation (what the fused
+  decode kernels read) and B as ``(rank, out_features)``. We use a sentinel
+  object as the key, pre-allocate fp16 A/B tensors of those shapes (padded
+  to the Linear's padded in/out widths), and mutate them in place between
+  trials.
 
 * Weights live as EXL3 trellis blobs. ``LinearEXL3.get_weight_tensor()``
   dequantizes to a fp16 tensor of shape ``(in_features, out_features)``
@@ -577,7 +579,7 @@ class Exl3Model:
         self._layer_modules = [by_layer.get(i, {}) for i in range(max_layer + 1)]
 
         # Pre-allocate LoRA tensors on every target Linear.
-        # Shapes: A is (in_features, 1), B is (1, out_features). Both fp16.
+        # Shapes: A is (rank, in_features), B is (rank, out_features). Both fp16.
         if allocate_lora_slots:
             for per_layer in self._layer_modules:
                 for modules in per_layer.values():
@@ -598,8 +600,11 @@ class Exl3Model:
     def _allocate_lora_slot(self, module: Any) -> None:
         device = module.device
         rank = self._lora_rank()
+        # exllamav3 stores A as (rank, in) -- PEFT's lora_A orientation -- and
+        # applies x @ A.T @ B. in_features is the padded width; padded
+        # columns stay zero.
         a = torch.zeros(
-            (module.in_features, rank),
+            (rank, module.in_features),
             dtype=torch.float16,
             device=device,
         )
@@ -803,9 +808,10 @@ class Exl3Model:
                          lora_A_hf (1, in) = v^T W
                          lora_B_hf (out, 1) = -k v
             EXL3 view:   W_exl3 (in, out)   = W_hf.T
-                         A_exl3 (in, 1)     = W_exl3 @ v == W_hf.T @ v
+                         A_exl3 (1, in)     = (W_exl3 @ v).T == v^T W_hf
                          B_exl3 (1, out)    = (-k v).T
-            Forward in exllamav3 adds  x @ A @ B  to the projection output.
+            Forward in exllamav3 adds  x @ A.T @ B  to the projection output
+            (A is stored in PEFT's (rank, in) orientation).
 
         Padded vs unpadded: ``v`` has hidden_size = out_features_unpadded;
         anything beyond that is zero-padded.
@@ -822,13 +828,13 @@ class Exl3Model:
         # reconstruction so the full effective weight is never materialized
         # (see _ablation_a_exl3).
         if module.quant_type == "exl3":
-            A_unpad = self._ablation_a_exl3(module.inner, v, in_u).unsqueeze(-1)
+            A_unpad = self._ablation_a_exl3(module.inner, v, in_u).unsqueeze(0)
         elif module.quant_type == "fp16":
             # LinearFP16 stores .weight directly; same (in_p, out_p) layout
             # because exllamav3 keeps everything in input-major form for
             # its kernels.
             W = module.inner.weight
-            A_unpad = (W[:in_u, :out_u].to(torch.float32) @ v_u).unsqueeze(-1)
+            A_unpad = (W[:in_u, :out_u].to(torch.float32) @ v_u).unsqueeze(0)
         else:
             raise RuntimeError(
                 f"Unknown Linear.quant_type {module.quant_type!r} on {module.key}"
@@ -836,12 +842,12 @@ class Exl3Model:
 
         B_unpad = (-kernel_weight * v_u).unsqueeze(0)  # (1, out_u)
 
-        a_slot = module.lora_a_tensors[self._lora_key]
-        b_slot = module.lora_b_tensors[self._lora_key]
+        a_slot = module.lora_a_tensors[self._lora_key]  # (rank, in_p)
+        b_slot = module.lora_b_tensors[self._lora_key]  # (rank, out_p)
         # Pre-zero so any padded rows/cols are clean before we copy unpadded.
         a_slot.zero_()
         b_slot.zero_()
-        a_slot[:in_u, :1].copy_(A_unpad.to(torch.float16))
+        a_slot[:1, :in_u].copy_(A_unpad.to(torch.float16))
         b_slot[:1, :out_u].copy_(B_unpad.to(torch.float16))
 
     def _exl3_ext(self) -> Any:
@@ -1094,9 +1100,11 @@ class Exl3Model:
                     device = module.device
 
                     # The optimisable LoRA factors. exllamav3 layout:
-                    #   a: (in_features, rank), b: (rank, out_features)
-                    #   forward: output += x @ a @ b
-                    # We optimise on the unpadded slice.
+                    #   a: (rank, in_features), b: (rank, out_features)
+                    #   forward: output += x @ a.T @ b
+                    # We optimise on the unpadded slice in the (in, rank)
+                    # orientation the objective below is written in, and
+                    # transpose A once when writing it back into the slot.
                     a_slot = module.lora_a_tensors[self._lora_key]
                     b_slot = module.lora_b_tensors[self._lora_key]
 
@@ -1245,7 +1253,8 @@ class Exl3Model:
                         a16 = a_param.to(torch.float16)
                         b16 = b_param.to(torch.float16)
                         if torch.isfinite(a16).all() and torch.isfinite(b16).all():
-                            a_slot[:in_u, :rank].copy_(a16)
+                            # a_param is (in_u, rank); the slot is (rank, in_p).
+                            a_slot[:rank, :in_u].copy_(a16.T)
                             b_slot[:rank, :out_u].copy_(b16)
                         else:
                             print(
@@ -1738,9 +1747,11 @@ class Exl3Model:
                 for module in modules:
                     in_u = module.in_features_unpadded
                     out_u = module.out_features_unpadded
-                    a = module.lora_a_tensors[self._lora_key]
-                    b = module.lora_b_tensors[self._lora_key]
-                    a_peft = a[:in_u, :].T.contiguous().cpu()
+                    a = module.lora_a_tensors[self._lora_key]  # (rank, in_p)
+                    b = module.lora_b_tensors[self._lora_key]  # (rank, out_p)
+                    # A is already in PEFT's (rank, in) orientation; only the
+                    # padding is sliced off. B goes back to (out, rank).
+                    a_peft = a[:, :in_u].contiguous().cpu()
                     b_peft = b[:, :out_u].T.contiguous().cpu()
                     leaf = module.key.rsplit(".", 1)[-1]
                     if leaf.startswith("slice"):
@@ -1863,13 +1874,14 @@ class Exl3Model:
                 for module in modules:
                     in_u = module.in_features_unpadded
                     out_u = module.out_features_unpadded
-                    a = module.lora_a_tensors[self._lora_key]  # (in_p, 1) fp16
-                    b = module.lora_b_tensors[self._lora_key]  # (1, out_p) fp16
+                    a = module.lora_a_tensors[self._lora_key]  # (rank, in_p) fp16
+                    b = module.lora_b_tensors[self._lora_key]  # (rank, out_p) fp16
 
-                    # Slice off the padding, then transpose back to PEFT layout:
+                    # Slice off the padding. A is already in PEFT layout; B is
+                    # transposed back:
                     #   peft.lora_A.weight: (rank, in_features)
                     #   peft.lora_B.weight: (out_features, rank)
-                    a_peft = a[:in_u, :].T.contiguous().cpu()
+                    a_peft = a[:, :in_u].contiguous().cpu()
                     b_peft = b[:, :out_u].T.contiguous().cpu()
 
                     base_key = f"base_model.model.{module.key}"
@@ -1888,7 +1900,7 @@ class Exl3Model:
 
         # Slot rank matches the abliteration mode: 1 for directional ablation,
         # ara_lora_rank (default 128) when --use-ara-lora is active. The
-        # exllamav3 forward applies x @ A @ B with no scaling, so set
+        # exllamav3 forward applies x @ A.T @ B with no scaling, so set
         # lora_alpha == r to make PEFT's alpha/r scaling 1.0 on reload.
         rank = self._lora_rank()
         adapter_config = {
