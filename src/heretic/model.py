@@ -4,6 +4,7 @@
 import inspect
 from collections.abc import Callable
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Any, TypeAlias, cast
 
 import torch
@@ -52,6 +53,86 @@ def get_model_class(
         return AutoModelForCausalLM
 
 
+def check_model_resident(model: PreTrainedModel | PeftModel) -> None:
+    """
+    Ensure that all of the model's weights are resident in memory.
+    """
+    offloaded = [name for name, param in model.named_parameters() if param.is_meta]
+
+    if not offloaded:
+        return
+
+    raise Exception(
+        "The model does not fit into the available device memory: "
+        f"{len(offloaded)} weights (such as {', '.join(offloaded[:3])}) had to "
+        "be offloaded to CPU or disk. Heretic cannot process offloaded models "
+        "because it requires direct, persistent access to all weights, whereas "
+        "offloaded weights only exist temporarily during forward passes.\n"
+        "Possible remedies:\n"
+        "* Free up memory, e.g. by closing other applications.\n"
+        "* Change the device map (device_map/max_memory settings) so that all "
+        "weights fit into device memory.\n"
+        '* Enable 4-bit quantization (quantization = "bnb_4bit").'
+    )
+
+
+def _collapse_flattened_residual_streams(
+    hidden_states: tuple[FloatTensor, ...],
+    config: Any,
+) -> tuple[FloatTensor, ...]:
+    """
+    Average flattened multi-stream hidden states to hidden_size.
+
+    Some models (e.g. Qwen4-Exp) flatten their residual streams into the
+    component dimension instead of exposing a separate stream dimension, so
+    their hidden states have shape (prompt, position, streams * hidden_size).
+    The final entry is the merged model output (hidden_size) and is unchanged.
+    """
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        config = get_text_config()
+    hidden_size = getattr(config, "hidden_size", None)
+    streams = getattr(config, "hc_count", 1)
+    if hidden_size is None or streams <= 1:
+        return hidden_states
+    width = hidden_size * streams
+    return tuple(
+        h.unflatten(-1, (streams, hidden_size)).mean(-2) if h.shape[-1] == width else h
+        for h in hidden_states
+    )
+
+
+# Some chat templates (e.g. gpt-oss) insert the current date into the prompt,
+# which makes the residuals, and therefore the modified model, depend on the day
+# Heretic is run. Rendering templates with a fixed date keeps results reproducible.
+def strftime_fixed_date(format: str) -> str:
+    return datetime(2026, 1, 1, tzinfo=timezone.utc).strftime(format)
+
+
+def chat_template_supports_system_role(tokenizer: PreTrainedTokenizerBase) -> bool:
+    # Some chat templates (e.g. Gemma 2 and its fine-tunes) reject the system role
+    # outright, raising when one is present; others silently drop it. The only
+    # reliable way to tell is to render a probe chat and check whether a sentinel
+    # system message survives into the output. This is also how llama.cpp's template
+    # engine (minja) detects system-role support.
+    sentinel = "HERETIC_SYSTEM_ROLE_PROBE"
+    try:
+        rendered = cast(
+            str,
+            tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": sentinel},
+                    {"role": "user", "content": "Hi"},
+                ],
+                add_generation_prompt=True,
+                tokenize=False,
+            ),
+        )
+    except Exception:
+        return False
+    return sentinel in rendered
+
+
 # The list contains one element per layer.
 # Each element maps from the component name to a (possibly sparse) mapping
 # from the module index to an (input, output) tuple containing the I/O
@@ -66,6 +147,8 @@ class Model:
     processor: ProcessorMixin | None
     peft_config: LoraConfig
     dtype: torch.dtype
+    # Whether the model's chat template accepts a system role (see __init__).
+    supports_system_role: bool
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -104,6 +187,11 @@ class Model:
         #           Right-padding causes empty outputs because the model sees PAD tokens
         #           after the prompt and thinks the sequence is complete.
         self.tokenizer.padding_side = "left"
+
+        # Detect once whether this tokenizer's chat template accepts a system
+        # role. Templates that don't (e.g. Gemma 2) need the system prompt folded
+        # into the first user message instead (see _apply_system_role).
+        self.supports_system_role = chat_template_supports_system_role(self.tokenizer)
 
         self.model = None
         self.max_memory = (
@@ -156,6 +244,10 @@ class Model:
                         )
                     ],
                     max_new_tokens=1,
+                    # The KV cache is deliberately left enabled here so we can
+                    # catch dtype errors related to the cache, which we will need
+                    # for generating responses.
+                    # use_cache=False,
                 )
             except Exception as error:
                 self.model = None
@@ -177,6 +269,8 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
+        check_model_resident(self.model)
+
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
 
         all_components = {}
@@ -186,7 +280,7 @@ class Model:
                     all_components[component] = 0
                 all_components[component] += len(modules)
 
-        print("* Abliterable components:")
+        print("* Modifiable components:")
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
 
@@ -194,7 +288,7 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
 
-        # Always use LoRA adapters for abliteration (faster reload, no weight modification).
+        # Always use LoRA adapters for modification (faster reload, no weight modification).
         # Collect actual leaf module names from the model for LoRA targeting.
         # This is more robust than splitting component keys (e.g. "attn.o_proj" -> "o_proj")
         # because hybrid models like Qwen3.5 MoE have modules with different names
@@ -229,6 +323,15 @@ class Model:
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+
+        # PEFT initializes A randomly from the global RNG. B is zero, so this doesn't
+        # change the model, but zeroing A too keeps saved adapters reproducible.
+        self._zero_lora_weights()
+
+    def _zero_lora_weights(self):
+        for name, module in self.model.named_modules():
+            if ("lora_A" in name or "lora_B" in name) and hasattr(module, "weight"):
+                torch.nn.init.zeros_(module.weight)
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
@@ -324,9 +427,9 @@ class Model:
 
         if current_model == self.settings.model and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation).
-            for name, module in self.model.named_modules():
-                if "lora_B" in name and hasattr(module, "weight"):
-                    torch.nn.init.zeros_(module.weight)
+            # Zeroing A as well ensures that adapter weights of modules not modified
+            # by the next trial don't depend on what previous trials did.
+            self._zero_lora_weights()
             return True
 
         # Purge existing model object from memory to make space.
@@ -353,6 +456,8 @@ class Model:
             **self.revision_kwargs,
             **extra_kwargs,
         )
+
+        check_model_resident(self.model)
 
         self.needs_reload = False
 
@@ -398,6 +503,10 @@ class Model:
         with suppress(Exception):
             try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty: ignore[unresolved-attribute]
 
+        # DeepSeek V4.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.o_b_proj)  # ty: ignore[unresolved-attribute]
+
         # Most dense models.
         with suppress(Exception):
             try_add("mlp.down_proj", layer.mlp.down_proj)  # ty: ignore[unresolved-attribute]
@@ -406,6 +515,14 @@ class Model:
         with suppress(Exception):
             for expert in layer.mlp.experts:  # ty:ignore[not-iterable, unresolved-attribute]
                 try_add("mlp.down_proj", expert.down_proj)  # ty: ignore[unresolved-attribute]
+
+        # Shared experts of MoE models (e.g. DeepSeek V4 and GLM 5.3).
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mlp.shared_experts.down_proj)  # ty: ignore[unresolved-attribute]
+
+        # Shared expert of MoE models (e.g. Qwen4-Exp).
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mlp.shared_expert.down_proj)  # ty: ignore[unresolved-attribute]
 
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
@@ -436,13 +553,13 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[not-iterable, unresolved-attribute]
                 try_add("mlp.down_proj", expert.output_linear)  # ty: ignore[unresolved-attribute]
 
-        # We need at least one module across all components for abliteration to work.
+        # We need at least one module across all components.
         total_modules = sum(len(mods) for mods in modules.values())
-        assert total_modules > 0, "No abliterable modules found in layer"
+        assert total_modules > 0, "No modifiable modules found in layer"
 
         return modules
 
-    def get_abliterable_components(self) -> list[str]:
+    def get_modifiable_components(self) -> list[str]:
         components: set[str] = set()
 
         # Scan all layers because hybrid models (e.g. Qwen3.5 MoE) have different
@@ -452,14 +569,51 @@ class Model:
 
         return sorted(components)
 
+    def _apply_system_role(
+        self, messages: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        # Templates that support the system role get the messages unchanged, so the
+        # rendered chat (and therefore the resulting weights) is byte-for-byte
+        # identical to before. For templates that reject it (e.g. Gemma 2), fold each
+        # system message into the next user message (what Gemma's own later templates
+        # do), so a system role anywhere in the chat is removed before rendering, not
+        # just a leading one. Empty system prompts are dropped; a system message with
+        # no following user message becomes a user turn.
+        if self.supports_system_role:
+            return messages
+        result: list[dict[str, str]] = []
+        pending: list[str] = []
+        for message in messages:
+            if message["role"] == "system":
+                if message["content"]:
+                    pending.append(message["content"])
+                continue
+            if pending and message["role"] == "user":
+                message = dict(message)
+                message["content"] = "\n\n".join([*pending, message["content"]])
+                pending = []
+            result.append(message)
+        if pending:
+            result.append({"role": "user", "content": "\n\n".join(pending)})
+        return result
+
     def _render_chat_prompts(self, prompts: list[Prompt]) -> list[str]:
         chats = [
-            [
-                {"role": "system", "content": prompt.system},
-                {"role": "user", "content": prompt.user},
-            ]
+            self._apply_system_role(
+                [
+                    {"role": "system", "content": prompt.system},
+                    {"role": "user", "content": prompt.user},
+                ]
+            )
             for prompt in prompts
         ]
+
+        # Overrides the function that templates call to get the current date.
+        # User-supplied chat_template_kwargs take precedence.
+        chat_template_kwargs: dict[str, Any] = {
+            "strftime_now": strftime_fixed_date,
+            **self.settings.chat_template_kwargs,
+        }
 
         # This cast is valid because list[str] is the return type
         # for batched operation with tokenize=False.
@@ -469,7 +623,7 @@ class Model:
                 chats,
                 add_generation_prompt=True,
                 tokenize=False,
-                **self.settings.chat_template_kwargs,
+                **chat_template_kwargs,
             ),
         )
 
@@ -566,6 +720,25 @@ class Model:
         # Hidden states for the first (only) generated token.
         # This cast is valid because we passed output_hidden_states=True above.
         hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+
+        # Models with Hyper-Connections (e.g. DeepSeek V4 and GLM 5.3) have several
+        # residual streams, so their hidden states have shape
+        # (prompt, position, stream, component). We use the mean of the streams.
+        # The last entry has no stream dimension, because Transformers replaces it
+        # with the model output, where the streams have already been merged.
+        hidden_states = tuple(
+            (
+                layer_hidden_states.mean(dim=2)
+                if layer_hidden_states.dim() == 4
+                else layer_hidden_states
+            )
+            for layer_hidden_states in hidden_states
+        )
+
+        hidden_states = _collapse_flattened_residual_streams(
+            cast(tuple[FloatTensor, ...], hidden_states),
+            self.model.config,
+        )
 
         # The returned tensor has shape (prompt, layer, component).
         residuals = torch.stack(
@@ -706,7 +879,11 @@ class Model:
                         )
                     )
 
-        self.generate(prompts, max_new_tokens=1)
+        self.generate(
+            prompts,
+            max_new_tokens=1,
+            use_cache=False,
+        )
 
         for hook_handle in hook_handles:
             hook_handle.remove()
@@ -920,6 +1097,7 @@ class Model:
         return slice_response_logits(outputs.logits, response_lengths)
 
     def stream_chat_response(self, chat: list[dict[str, str]]) -> str:
+        chat = self._apply_system_role(chat)
         # This cast is valid because str is the return type
         # for single-chat operation with tokenize=False.
         chat_prompt = cast(

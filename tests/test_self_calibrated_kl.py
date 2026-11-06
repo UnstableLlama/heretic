@@ -284,6 +284,7 @@ class HFBackendTests(unittest.TestCase):
 
         model = Model.__new__(Model)
         model.settings = IsolatedSettings(model="unused")
+        model.supports_system_role = True
         vocab = 7
         pad = 0
 

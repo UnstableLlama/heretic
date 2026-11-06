@@ -58,7 +58,12 @@ from torch import Tensor
 from torch.optim import LBFGS
 
 from .config import Settings
-from .model import ModuleIO
+from .model import (
+    Model,
+    ModuleIO,
+    chat_template_supports_system_role,
+    strftime_fixed_date,
+)
 from .modifiers.abliteration import RowNormalization
 from .modifiers.abliteration import WeightDistribution as AbliterationParameters
 from .modifiers.ara import Parameters as ARAParameters
@@ -232,6 +237,7 @@ class Exl3Model:
         self.settings = settings
         self.needs_reload = False
         self._adapter_rank = 1
+        self._supports_system_role: bool | None = None
         # Multimodal processor (vision preprocessing). Mirrors model.Model's
         # `processor` attribute, which main.py reads on the merged-model
         # save/upload path. Populated lazily in get_merged_model when the
@@ -693,11 +699,33 @@ class Exl3Model:
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Any]]:
         return self._layer_modules[layer_index]
 
-    def get_abliterable_components(self) -> list[str]:
+    def get_modifiable_components(self) -> list[str]:
         components: set[str] = set()
         for per_layer in self._layer_modules:
             components.update(per_layer.keys())
         return sorted(components)
+
+    @property
+    def supports_system_role(self) -> bool:
+        """Whether the chat template accepts a system role (see model.Model).
+
+        Evaluated lazily because probing requires the HF tokenizer, which
+        ``_Exl3Tokenizer`` only loads on first use.
+        """
+        cached = getattr(self, "_supports_system_role", None)
+        if cached is None:
+            tokenizer = getattr(self, "tokenizer", None)
+            cached = (
+                chat_template_supports_system_role(cast(Any, tokenizer))
+                if tokenizer is not None
+                else True
+            )
+            self._supports_system_role = cached
+        return cached
+
+    # Same system-prompt folding as the HF backend. The implementation only
+    # reads `self.supports_system_role`, so it is reused here as-is.
+    _apply_system_role = Model._apply_system_role
 
     # ------------------------------------------------------------------
     # Abliteration: compute LoRA update from refusal direction and write
@@ -1534,19 +1562,27 @@ class Exl3Model:
 
     def _render_chat_prompts(self, prompts: list[Prompt]) -> list[str]:
         chats = [
-            [
-                {"role": "system", "content": prompt.system},
-                {"role": "user", "content": prompt.user},
-            ]
+            self._apply_system_role(
+                [
+                    {"role": "system", "content": prompt.system},
+                    {"role": "user", "content": prompt.user},
+                ]
+            )
             for prompt in prompts
         ]
+        # Fixed date for reproducibility, as in the HF backend;
+        # user-supplied chat_template_kwargs take precedence.
+        chat_template_kwargs: dict[str, Any] = {
+            "strftime_now": strftime_fixed_date,
+            **self.settings.chat_template_kwargs,
+        }
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
                 chats,
                 add_generation_prompt=True,
                 tokenize=False,
-                **self.settings.chat_template_kwargs,
+                **chat_template_kwargs,
             ),
         )
         if self.settings.response_prefix:
@@ -1626,6 +1662,7 @@ class Exl3Model:
         interactive chat loop accepts the returned string as the final
         response.
         """
+        chat = self._apply_system_role(chat)
         chat_prompt = cast(
             str,
             self.tokenizer.apply_chat_template(

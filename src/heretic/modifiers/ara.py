@@ -4,13 +4,13 @@
 # Arbitrary-Rank Ablation (ARA) (Weidmann 2026)
 # See https://github.com/p-e-w/heretic/pull/211 for more information.
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, cast
 
 import bitsandbytes.functional as BNB_F
 import torch
 import torch.linalg as LA
-import torch.nn.functional as F
 from optuna import Trial
 from peft.tuners.lora.layer import Linear
 from pydantic import (
@@ -226,6 +226,9 @@ class ARA(Modifier[Parameters]):
         bad_prompts = ctx.load_prompts(self.settings.bad_prompts)
         print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
 
+        self.good_prompt_count = len(good_prompts)
+        self.bad_prompt_count = len(bad_prompts)
+
         print()
         print("Obtaining module I/O for good prompts...")
         self.good_module_io = model.get_module_io_batched(good_prompts)
@@ -246,9 +249,11 @@ class ARA(Modifier[Parameters]):
             0,
             layer_count // 2,
         )
+        # The end index is exclusive, so starting its range one above the start range's
+        # upper bound ensures that the layer range is never empty.
         end_layer_index = trial.suggest_int(
             "end_layer_index",
-            layer_count // 2,
+            layer_count // 2 + 1,
             layer_count,
         )
         preserve_good_behavior_weight = trial.suggest_float(
@@ -267,10 +272,12 @@ class ARA(Modifier[Parameters]):
             0.0,
             self.settings.overcorrect_relative_weight_max,
         )
+        # The nearest neighbors are selected from the outputs for the good and bad prompts,
+        # which contain one vector per prompt, so there can't be more neighbors than prompts.
         neighbor_count = trial.suggest_int(
             "neighbor_count",
             1,
-            15,
+            min(15, self.good_prompt_count, self.bad_prompt_count),
         )
 
         return Parameters(
@@ -295,6 +302,11 @@ class ARA(Modifier[Parameters]):
                 self.settings,
             )
             return
+
+        # The model's reset zeroes both A and B, where all gradients vanish,
+        # so A must be initialized below for the optimization to make progress.
+        # Generating on the CPU keeps A independent of the device and the global RNG state.
+        generator = torch.Generator().manual_seed(cast(int, self.heretic_settings.seed))
 
         for layer_index in range(
             parameters.start_layer_index,
@@ -329,6 +341,17 @@ class ARA(Modifier[Parameters]):
                     lora_A = cast(Tensor, module.lora_A["default"].weight)
                     lora_B = cast(Tensor, module.lora_B["default"].weight)
 
+                    # Initialize A the same way PEFT does, but deterministically. See
+                    # https://github.com/huggingface/peft/blob/v0.21.2/src/peft/tuners/lora/layer.py#L338
+                    initial_A = torch.empty(lora_A.shape)
+                    torch.nn.init.kaiming_uniform_(
+                        initial_A,
+                        a=math.sqrt(5),
+                        generator=generator,
+                    )
+                    with torch.no_grad():
+                        lora_A.copy_(initial_A)
+
                     # Move I/O tensors to the device of the adapter weights.
                     good_input, good_output = self.good_module_io[layer_index][
                         component
@@ -342,18 +365,43 @@ class ARA(Modifier[Parameters]):
                     bad_input = bad_input.float().to(lora_A.device)
                     bad_output = bad_output.float().to(lora_A.device)
 
+                    # The base product input @ W_base.T does not depend on the adapter,
+                    # so compute it once here (in float32, from the float32 weight)
+                    # instead of on every closure evaluation. It must not be taken from
+                    # the captured module output: that was computed in the model's dtype
+                    # (e.g. bfloat16) and would change the objective.
+                    good_product = good_input @ W_base.T
+                    bad_product = bad_input @ W_base.T
+
+                    # ARA only modifies the weight. If the module has a bias, the
+                    # captured output includes it, so add it back to the modified output
+                    # (after row normalization, which must not rescale the bias).
+                    bias = cast(Tensor | None, module.base_layer.bias)
+                    if bias is not None:
+                        bias = bias.detach().float().to(lora_A.device)
+
                     def objective(A: Tensor, B: Tensor) -> Tensor:
-                        # Calculate effective weight after applying adapter.
-                        W_eff = W_base + (B @ A)
+                        # input @ (W_base + B @ A).T
+                        #   = input @ W_base.T + (input @ A.T) @ B.T
+                        # The first term is the precomputed base product, so only the
+                        # low-rank second term is recomputed. This avoids materializing
+                        # the dense effective weight and the full input @ W_eff.T product
+                        # on every closure evaluation.
+                        new_good_output = good_product + (good_input @ A.T) @ B.T
+                        new_bad_output = bad_product + (bad_input @ A.T) @ B.T
 
                         if self.settings.preserve_row_magnitudes:
-                            # Normalize to unit length, then scale by original norms,
-                            # preserving the original row norms.
-                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
+                            # Row normalization rescales each output row by
+                            # (original row norm / effective row norm), which applies
+                            # directly to the outputs as a per-column factor.
+                            eff_row_norms = LA.vector_norm(W_base + (B @ A), dim=1)
+                            scale = W_row_norms.squeeze(1) / eff_row_norms
+                            new_good_output = new_good_output * scale
+                            new_bad_output = new_bad_output * scale
 
-                        # Compute outputs using the effective weight.
-                        new_good_output = good_input @ W_eff.T
-                        new_bad_output = bad_input @ W_eff.T
+                        if bias is not None:
+                            new_good_output = new_good_output + bias
+                            new_bad_output = new_bad_output + bias
 
                         loss = ara_loss(
                             good_output,
