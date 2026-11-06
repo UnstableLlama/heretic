@@ -29,6 +29,7 @@ from optuna.trial import FrozenTrial
 from psutil import Process
 from questionary import Question
 from rich.console import Console
+from torch import Tensor
 
 from .config import DatasetSpecification, Settings, SingleDatasetSpecification
 from .system import (
@@ -303,6 +304,74 @@ def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
+def trim_response_token_ids(
+    token_ids: list[int],
+    eos_token_ids: set[int],
+    pad_token_id: int | None,
+) -> list[int]:
+    """
+    Cut a generated token sequence after its first end-of-sequence token
+    (which is kept, because predicting it is part of the response), or strip
+    trailing padding when generation ran to the length limit without one.
+    """
+    for index, token_id in enumerate(token_ids):
+        if token_id in eos_token_ids:
+            return token_ids[: index + 1]
+
+    end = len(token_ids)
+    while end > 0 and pad_token_id is not None and token_ids[end - 1] == pad_token_id:
+        end -= 1
+
+    return token_ids[:end]
+
+
+def build_teacher_forced_batch(
+    prompt_token_ids: list[list[int]],
+    response_token_ids: list[list[int]],
+    pad_token_id: int,
+) -> tuple[Tensor, Tensor]:
+    """
+    Concatenate each prompt with its response and left-pad the rows to a
+    common length, so that the response always occupies the final positions
+    of its row. Returns `(input_ids, attention_mask)`.
+    """
+    rows = [
+        list(prompt) + list(response)
+        for prompt, response in zip(prompt_token_ids, response_token_ids)
+    ]
+    max_length = max(len(row) for row in rows)
+
+    input_ids = torch.full((len(rows), max_length), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((len(rows), max_length), dtype=torch.long)
+    for index, row in enumerate(rows):
+        input_ids[index, max_length - len(row) :] = torch.tensor(row, dtype=torch.long)
+        attention_mask[index, max_length - len(row) :] = 1
+
+    return input_ids, attention_mask
+
+
+def slice_response_logits(logits: Tensor, response_lengths: list[int]) -> list[Tensor]:
+    """
+    Given logits of shape `(batch, kept, vocabulary)` for the *last* `kept`
+    positions of rows built by `build_teacher_forced_batch`, return for each
+    row the `(response_length, vocabulary)` logits that predict its response
+    tokens. The logits predicting token `t` sit at position `t - 1`, so these
+    are the `response_length` positions ending one before the final position.
+    Works whether `kept` covers the whole row or only its tail, as long as
+    `kept >= response_length + 1`.
+    """
+    kept = logits.shape[1]
+    slices = []
+    for row, length in enumerate(response_lengths):
+        if kept < length + 1:
+            raise ValueError(
+                f"Need logits for at least {length + 1} positions to score a "
+                f"{length}-token response, got {kept}"
+            )
+        slices.append(logits[row, kept - 1 - length : kept - 1])
+    return slices
+
+
 def get_readme_intro(
     settings: Settings,
     modifier: Modifier[Any],
@@ -344,7 +413,7 @@ def get_readme_intro(
     else:
         reproducibility_instructions = ""
 
-    return f"""# This is a decensored version of {
+    return f"""# This is a {settings.modified_model_type} version of {
         model_link
     }, made using [Heretic](https://heretic-project.org) v{version("heretic-llm")}
 {reproducibility_instructions}
@@ -582,7 +651,7 @@ This directory contains the necessary information and assets to reproduce the re
 - [`requirements.txt`](requirements.txt): The exact versions of all Python packages.
 - [`config.toml`](config.toml): The exact configuration used, including the RNG seed.
 - [`{checkpoint_filename}`]({checkpoint_filename}): The Optuna study journal containing the history of all trials.
-- [`SHA256SUMS`](SHA256SUMS): Cryptographic hashes for all weight files.
+- [`SHA256SUMS.txt`](SHA256SUMS.txt): Cryptographic hashes for all weight files.
 - [`reproduce.json`](reproduce.json): A machine-readable file containing all reproducibility information.
 
 ## How to reproduce
@@ -597,8 +666,8 @@ This directory contains the necessary information and assets to reproduce the re
 1. Place the provided `config.toml` in your working directory.
 1. Run Heretic without any additional arguments: `heretic`
 1. Wait for the run to finish, then select trial **{trial.user_attrs["index"]}** and export the model.
-1. Verify that the weight files have been exactly reproduced by comparing their SHA-256 hashes against those in `SHA256SUMS`:
-   `sha256sum -c SHA256SUMS` (or look at the hashes online if you uploaded to Hugging Face)
+1. Verify that the weight files have been exactly reproduced by comparing their SHA-256 hashes against those in `SHA256SUMS.txt`:
+   `sha256sum -c SHA256SUMS.txt` (or look at the hashes online if you uploaded to Hugging Face)
 
 > [!TIP]
 > To use the included Optuna study journal `{checkpoint_filename}`, place it in the checkpoints directory (usually `checkpoints/`) before running Heretic.
@@ -655,7 +724,7 @@ def generate_reproduce_json(
 
 
 def generate_sha256sums(hashes: dict[str, str]) -> str:
-    """Generates GNU Coreutils compatible SHA256SUMS file content."""
+    """Generates GNU Coreutils compatible content for SHA256SUMS.txt."""
 
     lines = []
 
@@ -711,7 +780,7 @@ def create_reproduce_folder(
     )
 
     if uploaded_model_hashes:
-        (reproduce_dir / "SHA256SUMS").write_text(
+        (reproduce_dir / "SHA256SUMS.txt").write_text(
             generate_sha256sums(uploaded_model_hashes),
             encoding="utf-8",
         )

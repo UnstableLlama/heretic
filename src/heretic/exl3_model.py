@@ -58,14 +58,25 @@ from torch import Tensor
 from torch.optim import LBFGS
 
 from .config import Settings
-from .model import ModuleIO
+from .model import (
+    Model,
+    ModuleIO,
+    chat_template_supports_system_role,
+    strftime_fixed_date,
+)
 from .modifiers.abliteration import RowNormalization
 from .modifiers.abliteration import WeightDistribution as AbliterationParameters
 from .modifiers.ara import Parameters as ARAParameters
 from .modifiers.ara import Settings as ARASettings
 from .modifiers.ara import mean_distances_to_knn
 from .system import empty_cache
-from .utils import Prompt, batchify, print
+from .utils import (
+    Prompt,
+    batchify,
+    build_teacher_forced_batch,
+    print,
+    slice_response_logits,
+)
 
 # Match keys like:
 #   model.layers.<N>.self_attn.o_proj                     (standard)
@@ -226,6 +237,7 @@ class Exl3Model:
         self.settings = settings
         self.needs_reload = False
         self._adapter_rank = 1
+        self._supports_system_role: bool | None = None
         # Multimodal processor (vision preprocessing). Mirrors model.Model's
         # `processor` attribute, which main.py reads on the merged-model
         # save/upload path. Populated lazily in get_merged_model when the
@@ -251,6 +263,7 @@ class Exl3Model:
         )
 
         model_path = str(Path(settings.model).expanduser())
+        self._loaded_model_path = model_path
         self.config = self._exl_api["Config"].from_directory(model_path)
         self.model = self._exl_api["Model"].from_config(self.config)
 
@@ -686,11 +699,33 @@ class Exl3Model:
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Any]]:
         return self._layer_modules[layer_index]
 
-    def get_abliterable_components(self) -> list[str]:
+    def get_modifiable_components(self) -> list[str]:
         components: set[str] = set()
         for per_layer in self._layer_modules:
             components.update(per_layer.keys())
         return sorted(components)
+
+    @property
+    def supports_system_role(self) -> bool:
+        """Whether the chat template accepts a system role (see model.Model).
+
+        Evaluated lazily because probing requires the HF tokenizer, which
+        ``_Exl3Tokenizer`` only loads on first use.
+        """
+        cached = getattr(self, "_supports_system_role", None)
+        if cached is None:
+            tokenizer = getattr(self, "tokenizer", None)
+            cached = (
+                chat_template_supports_system_role(cast(Any, tokenizer))
+                if tokenizer is not None
+                else True
+            )
+            self._supports_system_role = cached
+        return cached
+
+    # Same system-prompt folding as the HF backend. The implementation only
+    # reads `self.supports_system_role`, so it is reused here as-is.
+    _apply_system_role = Model._apply_system_role
 
     # ------------------------------------------------------------------
     # Abliteration: compute LoRA update from refusal direction and write
@@ -897,7 +932,18 @@ class Exl3Model:
         """Zero all LoRA contributions. The current model stays loaded; no
         weight reload is necessary because abliteration happens entirely
         through the additive LoRA path.
+
+        If ``settings.model`` no longer names the loaded directory (the
+        ``--evaluate-model`` path in ``main.py`` swaps it after the baselines
+        are computed), the current weights are unloaded and the new model is
+        loaded in their place, mirroring the HF backend's slow path. Returns
+        False in that case.
         """
+        new_path = str(Path(self.settings.model).expanduser())
+        if new_path != getattr(self, "_loaded_model_path", new_path):
+            self._reload_model()
+            return False
+
         self._invalidate_generator()
         for per_layer in self._layer_modules:
             for modules in per_layer.values():
@@ -906,6 +952,19 @@ class Exl3Model:
                     module.lora_b_tensors[self._lora_key].zero_()
 
         return True
+
+    def _reload_model(self) -> None:
+        """Unload the current weights and load ``settings.model`` from scratch."""
+        self._invalidate_generator()
+        self._generator = None
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "unload"):
+            model.unload()
+        self.model = cast(Any, None)
+        self.cache = cast(Any, None)
+        self._layer_modules = []
+        empty_cache()
+        self.__init__(self.settings, inspect_only=self._inspect_only)
 
     # ------------------------------------------------------------------
     # ARA: module I/O capture + ARA LoRA optimisation
@@ -1200,24 +1259,7 @@ class Exl3Model:
     # ------------------------------------------------------------------
 
     def _tokenize_chat(self, prompts: list[Prompt]) -> Tensor:
-        chats = [
-            [
-                {"role": "system", "content": prompt.system},
-                {"role": "user", "content": prompt.user},
-            ]
-            for prompt in prompts
-        ]
-        chat_prompts = cast(
-            list[str],
-            self.tokenizer.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=False,
-                **self.settings.chat_template_kwargs,
-            ),
-        )
-        if self.settings.response_prefix:
-            chat_prompts = [p + self.settings.response_prefix for p in chat_prompts]
+        chat_prompts = self._render_chat_prompts(prompts)
 
         # Use the HF tokenizer for left-padded batch tokenization. We feed
         # raw input_ids to exllamav3.Model.forward; no attention mask is
@@ -1243,11 +1285,17 @@ class Exl3Model:
         input_ids: Tensor,
         *,
         last_only: bool = False,
+        last_tokens: int | None = None,
         capture_residuals: bool = False,
     ) -> tuple[Tensor, list[Tensor]]:
         """Run a single forward pass. Returns (logits, export_states)
         where logits is (B, T_out, vocab) and export_states is a list of
         (B, T, H) tensors (one per captured point: embed-out + per-block).
+
+        ``last_only`` keeps only the final position's logits; ``last_tokens``
+        keeps the final N positions (exllamav3 slices the hidden state right
+        before the LM head, so earlier positions never reach the vocabulary
+        projection).
 
         Note: this is a fresh, stateless forward — we hand the model a
         new params dict each call. The Cache may accumulate, but for
@@ -1258,6 +1306,8 @@ class Exl3Model:
         params: dict[str, Any] = {}
         if last_only:
             params["last_tokens_only"] = 1
+        elif last_tokens is not None:
+            params["last_tokens_only"] = int(last_tokens)
         if capture_residuals:
             params["capture_residuals"] = True
         with torch.inference_mode():
@@ -1349,6 +1399,95 @@ class Exl3Model:
             out.append(self.get_logits(batch))
         return torch.cat(out, dim=0)
 
+    def get_response_token_ids(
+        self,
+        prompts: list[Prompt],
+        max_new_tokens: int,
+    ) -> list[list[int]]:
+        """Greedily generate a response per prompt and return its token IDs.
+
+        exllamav3's convenience generator returns text, so the completion is
+        re-tokenized with the HF tokenizer (special tokens kept). The stop
+        token itself is not part of the returned text; when generation ended
+        on it, that token's id is appended so that the end of the response is
+        a scored position, matching the HF backend.
+        """
+        chat_prompts = self._render_chat_prompts(prompts)
+        completions, results = self._ensure_generator().generate(
+            prompt=chat_prompts,
+            max_new_tokens=max_new_tokens,
+            completion_only=True,
+            add_bos=False,
+            encode_special_tokens=True,
+            decode_special_tokens=True,
+            sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
+            seed=0,
+            return_last_results=True,
+        )
+        if isinstance(completions, str):
+            completions = [completions]
+            results = [results]
+
+        hf = self.tokenizer._ensure_hf()
+        eos_token_id = hf.eos_token_id
+        response_token_ids: list[list[int]] = []
+        for completion, result in zip(completions, results):
+            token_ids = list(hf.encode(completion, add_special_tokens=False))
+            ended_on_stop_token = (
+                bool(result) and result.get("eos_reason") == "stop_token"
+            )
+            if ended_on_stop_token:
+                # Prefer the token that actually ended generation (e.g. a chat
+                # turn terminator such as <|eot|>), falling back to the
+                # tokenizer's EOS id.
+                stop_token_id = result.get("eos_triggering_token_id", eos_token_id)
+                if stop_token_id is not None:
+                    token_ids.append(int(stop_token_id))
+            response_token_ids.append(token_ids)
+        return response_token_ids
+
+    def get_response_logits(
+        self,
+        prompts: list[Prompt],
+        response_token_ids: list[list[int]],
+    ) -> list[Tensor]:
+        """Teacher-forced logits at the positions predicting each response token.
+
+        Returns one ``(response_length, vocab)`` view per prompt into a single
+        batch tensor. Rows are left-padded like every other forward in this
+        backend; only the final ``max(response_length) + 1`` positions are
+        projected to the vocabulary.
+        """
+        chat_prompts = self._render_chat_prompts(prompts)
+        hf = self.tokenizer._ensure_hf()
+        encoded = hf(
+            chat_prompts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+        )
+        prompt_token_ids = [
+            token_ids[mask.bool()].tolist()
+            for token_ids, mask in zip(encoded["input_ids"], encoded["attention_mask"])
+        ]
+
+        pad_token_id = hf.pad_token_id if hf.pad_token_id is not None else 0
+        input_ids, _ = build_teacher_forced_batch(
+            prompt_token_ids, response_token_ids, pad_token_id
+        )
+        response_lengths = [len(token_ids) for token_ids in response_token_ids]
+
+        logits, _ = self._forward(input_ids, last_tokens=max(response_lengths) + 1)
+
+        # exllamav3 may pad the LM head's output dimension; drop any padding
+        # columns so the softmax only ranges over real vocabulary entries.
+        vocab_size = getattr(self.config, "vocab_size", None)
+        if isinstance(vocab_size, int) and logits.shape[-1] > vocab_size:
+            logits = logits[..., :vocab_size]
+
+        return slice_response_logits(logits, response_lengths)
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
@@ -1370,6 +1509,35 @@ class Exl3Model:
                 tokenizer=Tokenizer.from_config(self.config),
             )
         return self._generator
+
+    def _stop_token_ids(self) -> list[int]:
+        """Every end-of-sequence token id the model may emit.
+
+        exllamav3's convenience generator installs *no* stop tokens unless
+        ``stop_conditions`` is given, so without this a chat model keeps
+        generating past its turn terminator until ``max_new_tokens``. The
+        exllamav3 config carries ``eos_token_id_list`` (config.json plus
+        generation_config.json, merged by its Tokenizer); the HF tokenizer's
+        EOS is added for good measure.
+        """
+        ids: list[int] = []
+        config = getattr(self, "config", None)
+        for candidate in (
+            getattr(config, "eos_token_id_list", None),
+            getattr(config, "eos_token_id", None),
+        ):
+            if candidate is None:
+                continue
+            for token_id in candidate if isinstance(candidate, list) else [candidate]:
+                if isinstance(token_id, int) and token_id not in ids:
+                    ids.append(token_id)
+        tokenizer = getattr(self, "tokenizer", None)
+        hf_eos = getattr(tokenizer, "eos_token_id", None)
+        if hf_eos is None and hasattr(tokenizer, "_ensure_hf"):
+            hf_eos = getattr(tokenizer._ensure_hf(), "eos_token_id", None)
+        if isinstance(hf_eos, int) and hf_eos not in ids:
+            ids.append(hf_eos)
+        return ids
 
     def _greedy_sampler(self) -> Any:
         """Return a GreedySampler instance. Mirrors HF's do_sample=False
@@ -1394,19 +1562,27 @@ class Exl3Model:
 
     def _render_chat_prompts(self, prompts: list[Prompt]) -> list[str]:
         chats = [
-            [
-                {"role": "system", "content": prompt.system},
-                {"role": "user", "content": prompt.user},
-            ]
+            self._apply_system_role(
+                [
+                    {"role": "system", "content": prompt.system},
+                    {"role": "user", "content": prompt.user},
+                ]
+            )
             for prompt in prompts
         ]
+        # Fixed date for reproducibility, as in the HF backend;
+        # user-supplied chat_template_kwargs take precedence.
+        chat_template_kwargs: dict[str, Any] = {
+            "strftime_now": strftime_fixed_date,
+            **self.settings.chat_template_kwargs,
+        }
         chat_prompts = cast(
             list[str],
             self.tokenizer.apply_chat_template(
                 chats,
                 add_generation_prompt=True,
                 tokenize=False,
-                **self.settings.chat_template_kwargs,
+                **chat_template_kwargs,
             ),
         )
         if self.settings.response_prefix:
@@ -1438,6 +1614,7 @@ class Exl3Model:
             add_bos=False,
             encode_special_tokens=True,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
         )
         if isinstance(completions, str):
@@ -1463,6 +1640,7 @@ class Exl3Model:
             encode_special_tokens=True,
             decode_special_tokens=not skip_special_tokens,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
         )
         return [responses] if isinstance(responses, str) else responses
@@ -1484,6 +1662,7 @@ class Exl3Model:
         interactive chat loop accepts the returned string as the final
         response.
         """
+        chat = self._apply_system_role(chat)
         chat_prompt = cast(
             str,
             self.tokenizer.apply_chat_template(
@@ -1501,6 +1680,7 @@ class Exl3Model:
             add_bos=False,
             encode_special_tokens=True,
             sampler=self._greedy_sampler(),
+            stop_conditions=self._stop_token_ids(),
             seed=0,
         )
         if isinstance(completion, list):
