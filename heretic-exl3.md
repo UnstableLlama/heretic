@@ -94,6 +94,38 @@ Save either a PEFT adapter or merge into an original HF base model. Set
 `exl3_base_model` when the quantized model metadata cannot identify that base.
 Adapters retain their active rank and export unpadded tensors in PEFT orientation.
 Merging loads the HF base on CPU; it does not rewrite quantized EXL3 weights.
+
+### Merging MoE models
+
+ExLlamaV3 *unfuses* MoE experts during conversion: each expert becomes its own
+module (`...experts.<I>.down_proj`). Transformers stores the experts of nearly
+every MoE architecture (Gemma 4, gpt-oss, Qwen3/3.5 MoE, Mistral 4, LFM2 MoE, ...)
+as one fused tensor (`...experts.down_proj`, shape `(experts, out, in)`), which
+PEFT cannot attach an adapter to. Merging through PEFT therefore drops every
+expert adapter and yields a model in which only the dense modules are modified.
+
+Heretic's merge does not use PEFT. `heretic/lora_merge.py` adds `B @ A` to the
+base weights itself and
+
+- re-fuses per-expert adapters into the matching slice of the fused tensor,
+- reassembles sliced projections (`...down_proj.slice.<M>`),
+- matches on the `layers.<N>.…` tail of the name when the EXL3 tensor names and
+  the HF base use different prefixes (a backbone nested in a wrapper model, or a
+  quantization made from renamed tensors),
+- loads bases whose custom code is registered for `AutoModel` only, and
+- reports every adapter it could not place, and fails instead of returning an
+  unmodified base.
+
+The `merge.py` written next to a saved adapter embeds the same code and has no
+Heretic dependency. **Do not merge an EXL3 adapter of an MoE model with
+`PeftModel.merge_and_unload()`**; use `merge.py`:
+
+```sh
+python merge.py --base <original HF model> --output <dir> [--trust-remote-code]
+```
+
+The saved adapter itself stays in PEFT layout with ExLlamaV3's per-expert keys,
+so ExLlamaV3 can still load it against the quantized model.
 The built-in BenchmarkScore and interactive benchmark use Hugging Face's
 lm-eval backend: benchmark a merged HF export instead of an EXL3 model.
 
@@ -120,3 +152,24 @@ multi-GPU placement, dense/MoE generation and numerical comparison with saved
 adapters still require an explicitly authorized GPU smoke test. CPU tests and
 source inspection do not establish GPU numerical correctness. The upstream
 model-download/hash integration suite was not run during this sync.
+
+## Inkling 2
+
+Inkling 2 (Thinking Machines) is supported on the Hugging Face backend only;
+ExLlamaV3 has no Inkling architecture as of 1.6.7.
+
+- **Inkling 2 Small** loads with the pinned Transformers release.
+- **Inkling 2 Mini** is a looped model (`inkling2_loop`): 24 layers of weights,
+  of which layers 6-17 run three times. At the time of writing it needs
+  Transformers' unreleased `add-inkling2-mini` branch (5.24.0.dev0); install it
+  over the pinned release until 5.24 ships. Heretic unwraps its gated attention
+  output projection and keeps one residual per layer (the final loop pass) from
+  the 49 hidden states the model reports. The published checkpoint stores its
+  experts in NVFP4/MXFP8; Transformers dequantizes them on load, so plan for
+  roughly 53 GB of weights in bfloat16. `quantization = "bnb_4bit"` does not
+  help much, because bitsandbytes does not quantize fused expert tensors.
+
+Inkling has no dense MLP: every feed-forward block is a fused expert tensor,
+which the Hugging Face backend cannot attach adapters to. As with gpt-oss, only
+`attn.o_proj` is modified. The Inkling 2 Mini path is covered by unit tests but
+has not been run against the real checkpoint.

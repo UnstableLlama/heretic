@@ -60,10 +60,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import huggingface_hub
+import IPython
 import lm_eval
 import numpy as np
 import optuna
 import questionary
+import rich.traceback
 import torch
 import transformers
 from huggingface_hub import HfApi, ModelCard, ModelCardData
@@ -79,7 +81,6 @@ from questionary import Choice, Style
 from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
-from rich.traceback import install
 
 from .config import (
     DatasetSpecification,
@@ -686,6 +687,18 @@ def run():
     modifier = modifier_entry.modifier
     modifier_name = modifier_entry.name
 
+    def write_plugin_settings_to_config() -> None:
+        # Plugins may mutate their settings at any time (e.g. pinning dataset
+        # commits during initialization, or resolving values during scoring),
+        # so the effective plugin settings are recorded immediately before
+        # every serialization of the settings object, to ensure that the
+        # serialized settings reflect the exact configuration that was used.
+        evaluator.write_settings_to_config()
+        modifier.write_settings_to_config(
+            "modifier",
+            modifier_entry.config.instance_name,
+        )
+
     # Clear cache before starting the optimization study.
     # This should free up memory from temporary objects created while initializing modifiers.
     empty_cache()
@@ -764,6 +777,7 @@ def run():
             load_if_exists=True,
         )
 
+        write_plugin_settings_to_config()
         study.set_user_attr("settings", settings.model_dump_json())
         study.set_user_attr("finished", False)
 
@@ -839,6 +853,14 @@ def run():
                     value="continue",
                 )
             )
+
+            if settings.enable_shell:
+                choices.append(
+                    Choice(
+                        title="Open in-context Python shell",
+                        value="shell",
+                    )
+                )
 
             choices.append(
                 Choice(
@@ -916,6 +938,7 @@ def run():
                         continue
 
                     settings.n_trials = len(study.trials) + n_additional_trials
+                    write_plugin_settings_to_config()
                     study.set_user_attr("settings", settings.model_dump_json())
                     study.set_user_attr("finished", False)
 
@@ -931,6 +954,53 @@ def run():
                         study.set_user_attr("finished", True)
 
                     break
+
+                if settings.enable_shell and trial == "shell":
+                    print()
+                    print(
+                        "[bold blue]This is an IPython shell running inside this Heretic session.[/]"
+                    )
+                    print("Among other things, it has access to the following objects:")
+                    print(
+                        "* [bold]settings[/], which can be both read from and written to"
+                    )
+                    print(
+                        "* [bold]model[/], with the [bold]model.model[/] and [bold]model.tokenizer[/] Transformers objects"
+                    )
+                    print(
+                        "* [bold]study[/], containing all trials in [bold]study.trials[/], and the Pareto front in [bold]study.best_trials[/]"
+                    )
+                    print(
+                        "* The special function [bold]choose_trial(trial)[/], which exits the shell and proceeds with the normal Heretic flow "
+                        "using the given trial object. The trial object is not restricted to trials from the Pareto front, "
+                        "and can even be constructed ad-hoc."
+                    )
+                    print(
+                        "[yellow]The shell is not sandboxed and won't stop you from corrupting objects beyond repair. "
+                        "With great power comes great responsibility.[/]"
+                    )
+
+                    def choose_trial(chosen_trial: Trial) -> None:
+                        nonlocal trial
+                        trial = chosen_trial
+                        IPython.get_ipython().ask_exit()
+
+                    # IPython installs a custom traceback handler
+                    # that overrides the Rich handler we installed.
+                    old_excepthook = sys.excepthook
+
+                    try:
+                        IPython.embed(
+                            display_banner=False,
+                            colors="neutral",
+                            confirm_exit=False,
+                        )
+                    finally:
+                        sys.excepthook = old_excepthook
+
+                    if trial == "shell":
+                        # choose_trial wasn't called inside the shell session.
+                        continue
 
                 print()
                 print(
@@ -950,7 +1020,7 @@ def run():
                 modifier.reset_model(ctx)
                 print(f"* Modifying model using {modifier_name}...")
                 parameters = modifier.parameters_class.from_dict(
-                    trial.user_attrs["parameters"]
+                    trial.user_attrs["parameters"]  # ty: ignore[unresolved-attribute]
                 )
                 modifier.modify_model(ctx, parameters)
 
@@ -1358,8 +1428,22 @@ def run():
                                 card.push_to_hub(repo_id, token=token)
 
                             if reproducibility_information != "none":
+                                # Record the final effective plugin settings so that the
+                                # exported config.toml and reproduce.json reflect the exact
+                                # configuration that was used.
+                                write_plugin_settings_to_config()
+                                # Refresh the settings stored in the study journal to allow
+                                # continuation with the current plugin state.
+                                study.set_user_attr(
+                                    "settings",
+                                    settings.model_dump_json(),
+                                )
+
                                 # Set the number of trials to the number of actual completed trials
                                 # for the reproduction configuration.
+                                # These updates are deliberately *not* written to the journal,
+                                # because the purpose of the journal is continuing the study with
+                                # more trials, and potentially choosing a different export strategy.
                                 settings.n_trials = len(study.trials)
                                 current_export_strategy = settings.export_strategy
                                 settings.export_strategy = strategy
@@ -1587,8 +1671,7 @@ def run():
 
 
 def main():
-    # Install Rich traceback handler.
-    install()
+    rich.traceback.install()
 
     try:
         run()

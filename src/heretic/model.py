@@ -13,13 +13,13 @@ from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
 from torch.utils.hooks import RemovableHandle
 from transformers import (
+    AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoProcessor,
     AutoTokenizer,
     BatchEncoding,
     BitsAndBytesConfig,
-    PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
     ProcessorMixin,
@@ -30,6 +30,7 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, Settings
+from .lora_merge import select_model_class
 from .system import empty_cache
 from .utils import (
     Prompt,
@@ -44,13 +45,11 @@ from .utils import (
 
 def get_model_class(
     model: str,
-) -> type[AutoModelForImageTextToText] | type[AutoModelForCausalLM]:
-    configs = PretrainedConfig.get_config_dict(model)
-
-    if any(("vision_config" in config) for config in configs):
-        return AutoModelForImageTextToText
-    else:
-        return AutoModelForCausalLM
+) -> type[AutoModelForImageTextToText] | type[AutoModelForCausalLM] | type[AutoModel]:
+    # AutoModelForImageTextToText for multimodal models, AutoModelForCausalLM for
+    # text-only models, and AutoModel for models whose custom code is registered
+    # for AutoModel only (e.g. Apriel Voice, a wrapper around a Gemma 4 backbone).
+    return select_model_class(model)
 
 
 def check_model_resident(model: PreTrainedModel | PeftModel) -> None:
@@ -105,6 +104,39 @@ def _collapse_flattened_residual_streams(
 # Some chat templates (e.g. gpt-oss) insert the current date into the prompt,
 # which makes the residuals, and therefore the modified model, depend on the day
 # Heretic is run. Rendering templates with a fixed date keeps results reproducible.
+def _collapse_looped_residual_streams(
+    hidden_states: tuple[FloatTensor, ...],
+    config: Any,
+) -> tuple[FloatTensor, ...]:
+    """
+    Keep one hidden state per layer for looped transformers.
+
+    Looped models (e.g. Inkling 2 Mini) run a contiguous range of layers several
+    times with shared weights, and report one hidden state per layer *application*:
+    (embeddings, pre-loop layers, loop pass 1, ..., loop pass n, post-loop layers).
+    Each pass restarts from the pre-loop state, and only the final pass feeds the
+    post-loop layers, so the final pass is the output of the looped layers.
+    """
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        config = get_text_config()
+    num_layers = getattr(config, "num_hidden_layers", None)
+    start = getattr(config, "loop_layer_index_start", None)
+    end = getattr(config, "loop_layer_index_end", None)
+    passes = getattr(config, "loop_num_passes", 1)
+    if num_layers is None or start is None or end is None or passes <= 1:
+        return hidden_states
+    loop_length = end - start
+    if len(hidden_states) != num_layers + (passes - 1) * loop_length + 1:
+        return hidden_states
+    final_pass = 1 + start + (passes - 1) * loop_length
+    return (
+        hidden_states[: 1 + start]
+        + hidden_states[final_pass : final_pass + loop_length]
+        + hidden_states[final_pass + loop_length :]
+    )
+
+
 def strftime_fixed_date(format: str) -> str:
     return datetime(2026, 1, 1, tzinfo=timezone.utc).strftime(format)
 
@@ -474,6 +506,14 @@ class Model:
         with suppress(Exception):
             return model.model.language_model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
+        # Custom wrappers around a multimodal or text-only backbone
+        # (e.g. Apriel Voice, which nests Gemma 4 under language_model).
+        with suppress(Exception):
+            return model.language_model.model.language_model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
+
+        with suppress(Exception):
+            return model.language_model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
+
         # Text-only models.
         return model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
@@ -496,7 +536,9 @@ class Model:
 
         # Standard self-attention out-projection (most models).
         with suppress(Exception):
-            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty: ignore[unresolved-attribute]
+            o_proj = layer.self_attn.o_proj  # ty: ignore[unresolved-attribute]
+            # Inkling 2 Mini wraps the projection in a gating module.
+            try_add("attn.o_proj", getattr(o_proj, "linear", o_proj))
 
         # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead of
         # standard self-attention, so self_attn.o_proj doesn't exist on those layers.
@@ -737,6 +779,11 @@ class Model:
 
         hidden_states = _collapse_flattened_residual_streams(
             cast(tuple[FloatTensor, ...], hidden_states),
+            self.model.config,
+        )
+
+        hidden_states = _collapse_looped_residual_streams(
+            hidden_states,
             self.model.config,
         )
 

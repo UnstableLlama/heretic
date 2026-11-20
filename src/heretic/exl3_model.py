@@ -57,7 +57,9 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import LBFGS
 
+from . import lora_merge
 from .config import Settings
+from .lora_merge import merge_lora_state_dict, select_model_class
 from .model import (
     Model,
     ModuleIO,
@@ -77,6 +79,74 @@ from .utils import (
     print,
     slice_response_logits,
 )
+
+_MERGE_SCRIPT_HEADER = """#!/usr/bin/env python3
+# Merge this Heretic EXL3 adapter into a full-precision Hugging Face model.
+#
+# Usage:
+#     python merge.py --base <HF_MODEL> --output <OUTPUT_DIR>
+#
+# --base should point to the original (unquantized) Hugging Face model that
+# the EXL3 quantization was derived from.
+#
+# Do not merge this adapter with PEFT (PeftModel.merge_and_unload): ExLlamaV3
+# unfuses MoE experts, so PEFT silently drops every expert adapter.
+
+"""
+
+_MERGE_SCRIPT_MAIN = """
+
+def main():
+    import argparse
+    import json
+    from pathlib import Path
+
+    from safetensors.torch import load_file
+    from transformers import AutoProcessor, AutoTokenizer
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base", default=__BASE__)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--device-map", default="cpu")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    args = parser.parse_args()
+
+    adapter_dir = Path(__file__).resolve().parent
+    adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text())
+    scale = adapter_config["lora_alpha"] / adapter_config["r"]
+    trust_remote_code = True if args.trust_remote_code else None
+
+    model = select_model_class(args.base).from_pretrained(
+        args.base,
+        torch_dtype=getattr(torch, args.dtype),
+        device_map=args.device_map,
+        trust_remote_code=trust_remote_code,
+    )
+
+    state = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    report = merge_lora_state_dict(model, state, scale)
+    print(
+        f"Merged {report.merged} adapters "
+        f"({report.merged_fused} re-fused into expert tensors)"
+    )
+    for name, reason in report.unmatched.items():
+        print(f"WARNING: not merged: {name} ({reason})")
+    if report.merged == 0:
+        raise SystemExit("No adapter could be merged; is --base the right model?")
+
+    model.save_pretrained(args.output, safe_serialization=True)
+    AutoTokenizer.from_pretrained(args.base).save_pretrained(args.output)
+    if __MULTIMODAL__:
+        AutoProcessor.from_pretrained(
+            args.base, trust_remote_code=trust_remote_code
+        ).save_pretrained(args.output)
+    print(f"Saved merged model to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+"""
 
 # Match keys like:
 #   model.layers.<N>.self_attn.o_proj                     (standard)
@@ -1692,15 +1762,55 @@ class Exl3Model:
     # Save: PEFT-format LoRA adapter sidecar
     # ------------------------------------------------------------------
 
+    def _export_adapter_tensors(self) -> tuple[dict[str, Tensor], set[str]]:
+        """Return the live adapters in PEFT layout, plus their leaf module names.
+
+        Tensor keys are
+            base_model.model.<full_key>.lora_A.weight  shape (rank, in_unpad)
+            base_model.model.<full_key>.lora_B.weight  shape (out_unpad, rank)
+        """
+        tensors: dict[str, Tensor] = {}
+        target_module_names: set[str] = set()
+
+        for per_layer in self._layer_modules:
+            for modules in per_layer.values():
+                for module in modules:
+                    in_u = module.in_features_unpadded
+                    out_u = module.out_features_unpadded
+                    a = module.lora_a_tensors[self._lora_key]  # (in_p, rank) fp16
+                    b = module.lora_b_tensors[self._lora_key]  # (rank, out_p) fp16
+
+                    # Slice off the padding, then transpose back to PEFT layout:
+                    #   peft.lora_A.weight: (rank, in_features)
+                    #   peft.lora_B.weight: (out_features, rank)
+                    base_key = f"base_model.model.{module.key}"
+                    tensors[f"{base_key}.lora_A.weight"] = (
+                        a[:in_u, :].T.contiguous().cpu()
+                    )
+                    tensors[f"{base_key}.lora_B.weight"] = (
+                        b[:, :out_u].T.contiguous().cpu()
+                    )
+
+                    # Leaf name for adapter_config.target_modules.
+                    leaf = module.key.rsplit(".", 1)[-1]
+                    if leaf.startswith("slice") or leaf.isdigit():
+                        # mlp.down_proj.slice.N -> down_proj
+                        leaf = module.key.rsplit(".", 3)[-3]
+                    target_module_names.add(leaf)
+
+        return tensors, target_module_names
+
     def get_merged_model(self) -> Any:
         """Merge the current EXL3 LoRA adapter into the original HF base model.
 
         EXL3 quantized weights themselves cannot be modified in-place, so this
-        path exports the current adapter, loads the original HF base model,
-        attaches the adapter with PEFT, and returns ``merge_and_unload()``.
+        path loads the original HF base model and adds the adapters to its
+        weights directly (see ``lora_merge``). PEFT is deliberately not used:
+        ExLlamaV3 unfuses MoE experts into per-expert Linears, while
+        Transformers stores them as one fused 3D parameter that PEFT cannot
+        attach an adapter to, so PEFT silently dropped every expert adapter.
         """
         import torch
-        from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
         from transformers import (
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
@@ -1709,11 +1819,17 @@ class Exl3Model:
 
         hf_base = self.settings.exl3_base_model or self._hf_base_model_name()
         multimodal = self._is_multimodal()
-        model_class = (
-            AutoModelForImageTextToText if multimodal else AutoModelForCausalLM
-        )
+        try:
+            # Also covers bases whose custom code is registered for AutoModel only.
+            model_class = select_model_class(hf_base)
+        except Exception:
+            model_class = (
+                AutoModelForImageTextToText if multimodal else AutoModelForCausalLM
+            )
 
         print("* Loading base model on CPU (this may take a while)...")
+        # trust_remote_code=None makes Transformers ask for confirmation if the
+        # base model ships custom code, the same as when loading an HF model.
         base_model = model_class.from_pretrained(
             hf_base,
             torch_dtype=torch.bfloat16,
@@ -1731,60 +1847,31 @@ class Exl3Model:
                     trust_remote_code=None,
                 )
 
-        target_module_names: set[str] = set()
-        adapter_state: dict[str, Tensor] = {}
-        for per_layer in self._layer_modules:
-            for modules in per_layer.values():
-                for module in modules:
-                    in_u = module.in_features_unpadded
-                    out_u = module.out_features_unpadded
-                    a = module.lora_a_tensors[self._lora_key]
-                    b = module.lora_b_tensors[self._lora_key]
-                    a_peft = a[:in_u, :].T.contiguous().cpu()
-                    b_peft = b[:, :out_u].T.contiguous().cpu()
-                    leaf = module.key.rsplit(".", 1)[-1]
-                    if leaf.startswith("slice"):
-                        leaf = module.key.rsplit(".", 3)[-3]
-                    target_module_names.add(leaf)
-                    base_key = f"base_model.model.{module.key}"
-                    adapter_state[f"{base_key}.lora_A.weight"] = a_peft
-                    adapter_state[f"{base_key}.lora_B.weight"] = b_peft
+        adapter_state, _ = self._export_adapter_tensors()
 
-        # Match the live slot rank (1 for directional ablation, ara_lora_rank
-        # when --use-ara-lora is active) and set lora_alpha == r so PEFT's
-        # alpha/r scaling reproduces the exllamav3 forward's implicit 1.0.
-        rank = self._lora_rank()
-        peft_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=rank,
-            lora_alpha=rank,
-            lora_dropout=0.0,
-            bias="none",
-            target_modules=sorted(target_module_names),
-            inference_mode=True,
+        # The exllamav3 forward applies x @ A @ B with no scaling.
+        print("* Merging LoRA adapters into base model...")
+        report = merge_lora_state_dict(base_model, adapter_state)
+
+        print(
+            f"* Merged [bold]{report.merged}[/] adapters "
+            f"([bold]{report.merged_fused}[/] re-fused into expert tensors)"
         )
-
-        print("* Applying LoRA adapters...")
-        peft_model = get_peft_model(base_model, peft_config)
-        # Load via PEFT's own state-dict loader rather than matching parameter
-        # names by hand: PEFT stores LoRA factors in adapter-named ModuleDicts,
-        # so the live parameter names carry a ".default" segment
-        # (...lora_A.default.weight) that the exported keys
-        # (...lora_A.weight) don't have. A manual `name in adapter_state`
-        # loop therefore matches nothing and silently merges an unmodified
-        # base model. set_peft_model_state_dict maps the export-format keys
-        # onto the active adapter correctly.
-        load_result = set_peft_model_state_dict(peft_model, adapter_state)
-        unexpected = getattr(load_result, "unexpected_keys", None)
-        if unexpected:
+        if report.unmatched:
+            example, reason = next(iter(report.unmatched.items()))
             print(
-                f"[yellow]* WARNING:[/] {len(unexpected)} adapter tensor(s) did "
-                "not map onto the base model and were dropped during merge "
-                f"(e.g. {unexpected[0]})."
+                f"[yellow]* WARNING:[/] {len(report.unmatched)} adapter(s) did "
+                "not map onto the base model and were [bold]not merged[/] "
+                f"(e.g. {example}: {reason}). Check that exl3_base_model is the "
+                "model this EXL3 quantization was made from."
+            )
+        if report.merged == 0 and adapter_state:
+            raise RuntimeError(
+                "No adapter could be merged into the base model; the result "
+                "would be an unmodified copy of it."
             )
 
-        print("* Merging LoRA adapters into base model...")
-        return peft_model.merge_and_unload()
+        return base_model
 
     def _is_multimodal(self) -> bool:
         """Check whether the model is multimodal, and so must be merged with
@@ -1855,33 +1942,7 @@ class Exl3Model:
         out_dir = Path(save_directory)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        tensors: dict[str, Tensor] = {}
-        target_module_names: set[str] = set()
-
-        for per_layer in self._layer_modules:
-            for modules in per_layer.values():
-                for module in modules:
-                    in_u = module.in_features_unpadded
-                    out_u = module.out_features_unpadded
-                    a = module.lora_a_tensors[self._lora_key]  # (in_p, 1) fp16
-                    b = module.lora_b_tensors[self._lora_key]  # (1, out_p) fp16
-
-                    # Slice off the padding, then transpose back to PEFT layout:
-                    #   peft.lora_A.weight: (rank, in_features)
-                    #   peft.lora_B.weight: (out_features, rank)
-                    a_peft = a[:in_u, :].T.contiguous().cpu()
-                    b_peft = b[:, :out_u].T.contiguous().cpu()
-
-                    base_key = f"base_model.model.{module.key}"
-                    tensors[f"{base_key}.lora_A.weight"] = a_peft
-                    tensors[f"{base_key}.lora_B.weight"] = b_peft
-
-                    # Leaf name for adapter_config.target_modules.
-                    leaf = module.key.rsplit(".", 1)[-1]
-                    if leaf.startswith("slice"):
-                        # mlp.down_proj.slice.N -> down_proj
-                        leaf = module.key.rsplit(".", 3)[-3]
-                    target_module_names.add(leaf)
+        tensors, target_module_names = self._export_adapter_tensors()
 
         multimodal = self._is_multimodal()
         hf_base = self._hf_base_model_name()
@@ -1922,71 +1983,21 @@ class Exl3Model:
                 with suppress(Exception):
                     shutil.copy2(sp, out_dir / fname)
 
-        # Write a ready-to-use merge script so users don't have to guess
-        # which AutoModel class to use (this is the #1 pitfall for EXL3
-        # adapters on multimodal models like Qwen 3.5).
-        model_class = (
-            "AutoModelForImageTextToText" if multimodal else "AutoModelForCausalLM"
-        )
+        # Write a ready-to-use merge script. It embeds lora_merge.py rather than
+        # using PeftModel.merge_and_unload(), which cannot merge the adapters of
+        # unfused MoE experts or sliced projections (see lora_merge).
         merge_script = (
-            "#!/usr/bin/env python3\n"
-            '"""Merge this Heretic EXL3 adapter into a full-precision HF model.\n'
-            "\n"
-            "Usage:\n"
-            "    python merge.py --base <HF_MODEL> --output <OUTPUT_DIR>\n"
-            "\n"
-            "The --base argument should point to the original (unquantized)\n"
-            "HuggingFace model that the EXL3 quant was derived from.\n"
-            '"""\n'
-            "\n"
-            "import argparse\n"
-            "from pathlib import Path\n"
-            "\n"
-            "import torch\n"
-            f"from transformers import {model_class}, AutoTokenizer"
-            + (", AutoProcessor\n" if multimodal else "\n")
-            + "from peft import PeftModel\n"
-            "\n"
-            "\n"
-            "def main():\n"
-            "    parser = argparse.ArgumentParser()\n"
-            f'    parser.add_argument("--base", default={hf_base!r})\n'
-            '    parser.add_argument("--output", required=True)\n'
-            '    parser.add_argument("--dtype", default="bfloat16")\n'
-            "    args = parser.parse_args()\n"
-            "\n"
-            "    dtype = getattr(torch, args.dtype)\n"
-            "    adapter_dir = str(Path(__file__).resolve().parent)\n"
-            "\n"
-            f"    model = {model_class}.from_pretrained(\n"
-            '        args.base, torch_dtype=dtype, device_map="auto",\n'
-            "    )\n"
-            "    model = PeftModel.from_pretrained(model, adapter_dir)\n"
-            "    merged = model.merge_and_unload()\n"
-            "\n"
-            "    merged.save_pretrained(args.output, safe_serialization=True)\n"
-            "    AutoTokenizer.from_pretrained(args.base).save_pretrained(args.output)\n"
-            + (
-                "    AutoProcessor.from_pretrained(args.base)"
-                ".save_pretrained(args.output)\n"
-                if multimodal
-                else ""
+            _MERGE_SCRIPT_HEADER
+            + inspect.getsource(lora_merge)
+            + _MERGE_SCRIPT_MAIN.replace("__BASE__", repr(hf_base)).replace(
+                "__MULTIMODAL__", repr(multimodal)
             )
-            + '    print(f"Saved merged model to {args.output}")\n'
-            "\n"
-            "\n"
-            'if __name__ == "__main__":\n'
-            "    main()\n"
         )
         (out_dir / "merge.py").write_text(merge_script)
 
         print(f"* Wrote PEFT adapter to [bold]{out_dir}[/]")
-        if multimodal:
-            print(
-                f"* [yellow]Note:[/] This model uses a multimodal architecture. "
-                f"When merging, load the base model with "
-                f"[bold]{model_class}[/], not AutoModelForCausalLM."
-            )
         print(
-            f"* A ready-to-use merge script was written to [bold]{out_dir}/merge.py[/]"
+            f"* A ready-to-use merge script was written to [bold]{out_dir}/merge.py[/]. "
+            "Use it instead of PEFT's merge_and_unload(), which drops the adapters "
+            "of MoE experts."
         )
