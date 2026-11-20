@@ -104,6 +104,7 @@ takes about 30-40 minutes.
 
 This fork also supports pre-quantized EXL3 models with `quantization = "exl3"`.
 See [EXL3 setup and compatibility](heretic-exl3.md).
+That document also covers merging adapters of MoE models and Inkling 2 support.
 
 After Heretic has finished processing a model, you are given the choice to
 save the model, upload it to Hugging Face, chat with it to test how well it works,
