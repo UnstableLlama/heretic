@@ -133,6 +133,10 @@ upload_tags = [
 # System prompt to use when prompting the model.
 system_prompt = "You are a helpful assistant."
 
+# Whether to offer the option to open an in-context Python shell in the trial selection menu.
+# WARNING: Enabling this feature gives full system access to the user of the Heretic session.
+enable_shell = false
+
 # Dataset of prompts to use for automatically determining the optimal batch size.
 [batch_size_test_prompts]
 dataset = "mlabonne/harmless_alpaca"
@@ -293,7 +297,7 @@ column = "text"
 score_name = "Refusals (Classifier)"
 
 # Hugging Face model ID, or path to a text-classification model on disk.
-model = "VINAY-UMRETHE/Refusal-Classifier"
+model = "VINAY-UMRETHE/Refusal-Classifier-V2"
 
 # Hugging Face commit hash of the classifier model.
 # Set this to pin a specific revision; unset means the latest revision
@@ -350,6 +354,9 @@ task = "piqa"
 
 # Task metric to use as the benchmark score.
 metric = "acc_norm,none"
+
+# Number of input sequences to process in parallel (0 = auto).
+batch_size = 0  # auto
 
 
 [scorer.ResponseLength]

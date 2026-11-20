@@ -1,6 +1,6 @@
 [project]
 name = "heretic-llm"
-version = "2.1.0.dev0"
+version = "2.2.0.dev0"
 description = "Training-free language model modification"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -29,6 +29,7 @@ dependencies = [
     "datasets~=5.0",
     "huggingface-hub~=1.33",
     "immutabledict~=4.3",
+    "ipython~=8.39",
     "langdetect~=1.0",
     "lm-eval[hf]~=0.4",
     "numpy~=2.2",
